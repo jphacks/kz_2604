@@ -1,0 +1,7 @@
+# Webプッシュ通知
+pywebpush
+cryptography
+# レシート読み取り（主：Gemini API）
+google-genai
+# 任意：Claude API に切り替えるとき
+anthropic

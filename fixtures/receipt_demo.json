@@ -1,0 +1,11 @@
+{
+  "purchased_at": "2026-10-26",
+  "items": [
+    {"ingredient_id": "pork_koma", "raw": "国産豚コマ切落"},
+    {"ingredient_id": "moyashi", "raw": "緑豆もやし"},
+    {"ingredient_id": "egg", "raw": "赤玉子10個"},
+    {"ingredient_id": "cabbage_half", "raw": "キャベツ1/2"},
+    {"ingredient_id": "tofu_kinu", "raw": "絹豆腐"}
+  ],
+  "ignored": ["ボックスティッシュ"]
+}

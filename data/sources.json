@@ -1,0 +1,22 @@
+{
+  "foodkeeper": {
+    "name": "USDA FoodKeeper（米国農務省）",
+    "url": "https://www.foodsafety.gov/keep-food-safe/foodkeeper-app",
+    "used_for": "冷蔵の日数、冷凍できるか（購入日からの日数 DOP_Refrigerate を使う）"
+  },
+  "maff_home_freezing": {
+    "name": "農林水産省「ホームフリージングする際の注意点について教えてください。」",
+    "url": "https://www.maff.go.jp/j/heya/sodan/1810/01.html",
+    "used_for": "冷凍の期間（家庭の冷凍室は緩慢凍結のため、2〜3週間以内に使い切る）"
+  },
+  "jp_moyashi": {
+    "name": "macaroni「もやしの保存方法」",
+    "url": "https://macaro-ni.jp/38400",
+    "used_for": "もやしの冷蔵日数（袋のまま2〜3日）。FoodKeeperの値より短いので、こちらを採用"
+  },
+  "jp_pork_freezing": {
+    "name": "DELISH KITCHEN「豚肉の冷凍保存」",
+    "url": "https://delishkitchen.tv/articles/1878",
+    "used_for": "豚肉の冷凍のしかた。トレイのまま冷凍すると肉汁で臭みが出やすい（品質の話で、安全性の話ではない）"
+  }
+}
