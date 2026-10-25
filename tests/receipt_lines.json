@@ -1,0 +1,15 @@
+[
+  { "line": "*贅を味わう麻婆豆腐の",   "expected": "mabo_moto" },
+  { "line": "*ﾌｰﾄﾞﾆｱ白きざみねぎ",       "expected": "negi" },
+  { "line": "*A&木綿とうふ150gx3",       "expected": "tofu" },
+  { "line": "国産豚コマ切落",            "expected": "pork_koma" },
+  { "line": "緑豆もやし",                "expected": "moyashi" },
+  { "line": "赤玉子10個",                "expected": "egg" },
+  { "line": "キャベツ1/2",               "expected": "cabbage" },
+  { "line": "絹豆腐",                    "expected": "tofu" },
+  { "line": "長ねぎ",                    "expected": "naganegi" },
+  { "line": "ﾓﾔｼ",                       "expected": "moyashi" },
+  { "line": "焼肉のたれ 豚こま用",        "expected": null },
+  { "line": "CookDo四川式麻婆",          "expected": null },
+  { "line": "ボックスティッシュ",        "expected": null }
+]

@@ -1,6 +1,6 @@
 """レシート読み取り（主の経路：Gemini API。Claude API にも切り替えられる）。
 
-LLM には「品名の行の文字起こし」と「購入日」だけをさせる。
+LLM には「品名の行の文字起こし」「各行のJANコード（印字があれば）」「購入日」だけをさせる。
 どの行がどの食材かの照合は server/ocr_match.py（コード）で行い、食材表は渡さない。
 
 どちらを使うかは .env の RECEIPT_ENGINE（gemini / claude）。
@@ -24,22 +24,27 @@ TIMEOUT_SECONDS = 45
 PROMPT = """これはスーパーのレシートの写真です。複数枚あるときは、1枚のレシートを上から順に分けて撮ったもので、つなぎ目は少し重なっています。
 
 次のJSONだけを返してください。説明文やコードブロックは付けないでください。
-{"purchased_at": "YYYY-MM-DD", "lines": ["品名", "品名", ...]}
+{"purchased_at": "YYYY-MM-DD", "lines": [{"name": "品名", "jan": "4902820208719"}, ...]}
 
 ルール:
-- lines には、買った品物の品名の行だけを、レシートの上から順に、印字のとおりに入れる
-- 店名、住所、電話番号、日時、小計、合計、税、お預り、お釣り、ポイント、支払い方法、値引きの行は入れない
+- lines には、買った品物の品名の行だけを、レシートの上から順に、印字のとおりに name に入れる
+- 品名のすぐ上か横に13桁または8桁のJANコードが印字されていれば jan に入れる。なければ null
+- 店名、住所、電話番号、案内文、日時、小計、合計、税、お預り、お釣り、ポイント、ポイント倍率、支払い方法、値引きの行は入れない
 - 値段や数量は入れない（品名の部分だけ）
 - 重なっている部分で同じ行が2回写っていたら、1回だけ入れる
 - 読めない行は推測せず、入れない
-- purchased_at はレシートに印字された日付。読めなければ null"""
+- purchased_at はレシートに印字された日付。読めなければ null。JANコードも読めなければ null"""
 
 # Gemini の出力をこの形に固定する
 RESULT_SCHEMA = {
     "type": "object",
     "properties": {
         "purchased_at": {"type": ["string", "null"], "description": "YYYY-MM-DD。読めなければ null"},
-        "lines": {"type": "array", "items": {"type": "string"}},
+        "lines": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "jan": {"type": ["string", "null"]}},
+            "required": ["name", "jan"],
+        }},
     },
     "required": ["purchased_at", "lines"],
 }
@@ -68,7 +73,16 @@ def _parse(text):
         data = json.loads(m.group(0))
     except json.JSONDecodeError as e:
         raise ReceiptError(f"読み取り結果を解析できませんでした: {e}")
-    lines = [str(x).strip() for x in data.get("lines") or [] if str(x).strip()]
+    lines = []
+    for x in data.get("lines") or []:
+        if isinstance(x, str):  # 古い形（品名だけ）にも対応する
+            x = {"name": x, "jan": None}
+        name = str(x.get("name") or "").strip()
+        jan = re.sub(r"\D", "", str(x.get("jan") or "")) or None
+        if jan and len(jan) not in (8, 13):
+            jan = None
+        if name:
+            lines.append({"name": name, "jan": jan})
     purchased_at = data.get("purchased_at")
     if purchased_at and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(purchased_at)):
         purchased_at = None

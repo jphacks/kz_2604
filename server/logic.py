@@ -1,43 +1,50 @@
 """判定ロジック。
 
 日数・期限・どの食材を救うか・どの料理を提案するかはすべてここで決める。LLMには判断させない。
-関数はすべて純粋関数（状態を書き換えない）にしてある。
+関数は、印を付ける mark_was_soon 以外は純粋関数（状態を書き換えない）にしてある。
 """
 from datetime import date, timedelta
 from urllib.parse import quote
 
-# --- 決定事項（CLAUDE.md 13. を参照） ---
-GRACE_DAYS = 1        # 残り日数がこれ以下なら soon
-NORMAL_MAX_DAYS = 3   # 残り日数がこれ以下なら normal、超えたら ok
-ASK_HOUR = 18         # 問いかけの時刻
-DEADLINE_HOUR = 21    # 返事の締め切り。過ぎたら skip
-REMIND_TIME = (21, 30)  # 「無理」の日の冷凍のリマインド
-REMIND_MIN_GAP_MINUTES = 30  # 遅く「無理」と答えた日は、答えてから最低これだけあけてリマインド
-REASK_MINUTES = 60    # 「まだ」のあとの再通知
-MAX_REASK = 2         # 「まだ」での再通知の上限回数
-MAX_SUGGESTIONS = 3   # 料理の提案の最大件数
-FREEZER_USE_DAYS = 14  # 冷凍したものの目安（農林水産省「2〜3週間」の短い方）
+# --- 決定事項（CLAUDE.md 第15節を参照） ---
+GRACE_DAYS = 0         # 残り日数がこれ以下なら soon（目安の最終日だけ。デモの 10/27 は通知なし、10/28 に問いかけ）
+NORMAL_MAX_DAYS = 2    # 残り日数がこれ以下なら normal、超えたら ok
+DEFAULT_ASK_TIME = "18:00"
+DEFAULT_REMIND_TIME = "21:30"
+REASK_MINUTES = 60     # 「あとで」のあとの再通知
+MAX_REASK = 1          # 「あとで」での再通知は1回だけ
+MAX_SUGGESTIONS = 3    # 料理の提案の最大件数
 COOKPAD_SEARCH = "https://cookpad.com/jp/search/"
 
-STATUS_LABEL = {"soon": "早めに", "normal": "ふつう", "ok": "余裕あり", "past": "状態を確かめてください"}
+STATUS_LABEL = {"soon": "早めに", "normal": "ふつう", "ok": "余裕あり", "past": "状態を確かめてください",
+                "none": "期限なし"}
 
 
 def parse_date(s):
-    return date.fromisoformat(s)
+    return date.fromisoformat(s[:10])
+
+
+def tracked(ing):
+    return ing.get("track_expiry", True) and ing.get("fridge_days") is not None
 
 
 def limit_date(inv, ing):
-    """推定の期限。パッケージの期限が入力されていればそれを優先する。"""
+    """冷蔵での推定の期限。パッケージの期限が入力されていればそれを優先する。期限を判定しない食材は None。"""
     if inv.get("expiry_override"):
         return parse_date(inv["expiry_override"])
+    if not tracked(ing):
+        return None
     return parse_date(inv["purchased_at"]) + timedelta(days=ing["fridge_days"])
 
 
 def days_left(inv, ing, today):
-    return (limit_date(inv, ing) - today).days
+    lim = limit_date(inv, ing)
+    return None if lim is None else (lim - today).days
 
 
 def freshness(left):
+    if left is None:
+        return "none"
     if left < 0:
         return "past"
     if left <= GRACE_DAYS:
@@ -50,22 +57,24 @@ def freshness(left):
 def describe(inv, ing, today):
     left = days_left(inv, ing, today)
     st = freshness(left)
+    lim = limit_date(inv, ing)
     return {
         **inv,
         "name": ing["name"],
         "days_left": left,
         "freshness": st,
         "freshness_label": STATUS_LABEL[st],
-        "limit_date": limit_date(inv, ing).isoformat(),
+        "limit_date": lim.isoformat() if lim else None,
         "source": ing["source"],
     }
 
 
 def urgency_key(inv, ing, today, order):
     """同順位の決め方：残り日数 → 消費期限の食品を先 → 購入日が古い順 → 食材表の順。"""
+    left = days_left(inv, ing, today)
     return (
-        days_left(inv, ing, today),
-        0 if ing["expiry_type"] == "consumption" else 1,
+        left if left is not None else 10 ** 6,
+        0 if ing.get("expiry_type") == "consumption" else 1,
         inv["purchased_at"],
         order[ing["id"]],
     )
@@ -84,116 +93,68 @@ def soon_items(inventory, ingredients, today, exclude_ids=()):
 
 
 def should_ask(inventory, ingredients, today):
-    items = soon_items(inventory, ingredients, today)
+    """問いかけを出す条件：冷蔵の soon の在庫が1つ以上。ホームのカードと通知で同じ条件。"""
     names = []
-    for inv in items:
+    for inv in soon_items(inventory, ingredients, today):
         name = ingredients[inv["ingredient_id"]]["name"]
         if name not in names:
             names.append(name)
-    return {"should_ask": bool(items), "reason_items": names}
+    return {"should_ask": bool(names), "reason_items": names}
 
 
-def _rescue_text(ing):
-    """救済行動の文。必ず条件付きにする（在庫がずれていても嘘にならないように）。"""
-    if ing["freezable"] and ing["freeze_action"]:
-        return f"{ing['name']}が残っていたら、{ing['freeze_action']}", ing["freeze_seconds"], "freeze"
-    if ing["quick_use"]:
-        return f"{ing['name']}が残っていたら、{ing['quick_use']}", ing["quick_use_seconds"], "quick_use"
-    return None
+def mark_was_soon(inventory, ingredients, today):
+    """一度でも soon になった在庫に印を付ける（「守れた」の判定に使う）。"""
+    for inv in soon_items(inventory, ingredients, today):
+        inv["was_soon"] = True
 
 
 def choose_action(inventory, ingredients, today, exclude_ids=()):
-    """最も急ぐ1品の救済行動と、次に急ぐ1品の「明日の朝の一手」を返す。"""
-    action = None
-    next_tip = None
-    for inv in soon_items(inventory, ingredients, today, exclude_ids):
-        ing = ingredients[inv["ingredient_id"]]
-        if action is None:
-            r = _rescue_text(ing)
-            if r is None:
-                continue
-            text, seconds, kind = r
-            action = {
-                "inventory_id": inv["id"],
-                "ingredient_id": ing["id"],
-                "name": ing["name"],
-                "kind": kind,
-                "text": text,
-                "seconds": seconds,
-                "note": ing.get("action_note"),
-                # 冷凍したあとの目安（農林水産省：ホームフリージングは2〜3週間以内に使い切る）
-                "storage": f"冷凍したら{ing['freezer_period']}以内に使い切る（農林水産省）"
-                           if kind == "freeze" and ing.get("freezer_period") else None,
-                "source": ing["source"],
-            }
-        elif ing["id"] != action["ingredient_id"] and ing["quick_use"]:
-            next_tip = f"{ing['name']}が残っていたら、{ing['quick_use']}"
-            break
-    return action, next_tip
+    """救済行動は1つだけ。soon のうち冷凍できる最も急ぐ1品を冷凍。なければ最も急ぐ1品の quick_use。"""
+    items = soon_items(inventory, ingredients, today, exclude_ids)
+    pick = next((inv for inv in items if ingredients[inv["ingredient_id"]]["freezable"]), None)
+    kind = "freeze"
+    if pick is None:
+        pick = next((inv for inv in items if ingredients[inv["ingredient_id"]].get("quick_use")), None)
+        kind = "quick_use"
+    if pick is None:
+        return None
+    ing = ingredients[pick["ingredient_id"]]
+    verb = ing["freeze_action"] if kind == "freeze" else ing["quick_use"]
+    return {
+        "inventory_id": pick["id"],
+        "ingredient_id": ing["id"],
+        "name": ing["name"],
+        "kind": kind,
+        # 条件の言葉（「残っていたら」）は付けない。代わりに画面に「○○はもう使った」を置く
+        "text": f"{ing['name']}を、{verb}",
+        "seconds": ing["freeze_seconds"] if kind == "freeze" else ing.get("quick_use_seconds"),
+        "note": ing.get("action_note"),
+        "storage": f"冷凍したら{ing['freezer_period']}以内に使い切る（農林水産省）"
+                   if kind == "freeze" and ing.get("freezer_period") else None,
+        "source": ing["source"],
+    }
 
 
 def cook_items(inventory, ingredients, today):
-    stocked = [inv for inv in inventory if inv["status"] == "stocked"]
+    stocked = [inv for inv in inventory if inv["status"] in ("stocked", "frozen")]
     stocked.sort(key=lambda inv: (inv["purchased_at"], inv["id"]))
-    return [describe(inv, ingredients[inv["ingredient_id"]], today) for inv in stocked]
+    return [{**describe(inv, ingredients[inv["ingredient_id"]], today), "frozen": inv["status"] == "frozen"}
+            for inv in stocked]
 
 
-def is_wasted(inv, ing, today):
-    """目安を過ぎても used/frozen/gone にならなかった在庫を wasted とみなす。"""
-    if inv["status"] == "wasted":
-        return True
-    return inv["status"] == "stocked" and days_left(inv, ing, today) < 0
+# ---------------- 冷凍庫 ----------------
 
-
-def week_range(today):
-    start = today - timedelta(days=today.weekday())  # 月曜はじまり
-    return start, start + timedelta(days=6)
-
-
-def weekly(inventory, ingredients, asks, freeze_checks, today):
-    start, end = week_range(today)
-
-    def in_week(d):
-        return start <= parse_date(d) <= end
-
-    week_inv = [inv for inv in inventory if in_week(inv["purchased_at"])]
-    wasted_inv = [inv for inv in week_inv if is_wasted(inv, ingredients[inv["ingredient_id"]], today)]
-    wasted = [ingredients[inv["ingredient_id"]]["name"] for inv in wasted_inv]
-    saved = [{"name": ingredients[inv["ingredient_id"]]["name"], "how": inv["status"]}
-             for inv in week_inv if inv["status"] in ("frozen", "used")]
-    protected = [d for d, a in asks.items()
-                 if in_week(d) and a.get("answer") == "skip"
-                 and freeze_checks.get(d, {}).get("status") == "done"]
-
-    # 間に合わなかった食材の説明（罪悪感ではなく、次にいつ声をかけるかを伝える）
-    wasted_detail = []
-    for inv in wasted_inv:
-        ing = ingredients[inv["ingredient_id"]]
-        if any(w["name"] == ing["name"] for w in wasted_detail):
-            continue
-        ask_from = max(0, ing["fridge_days"] - GRACE_DAYS)
-        when = {0: "買った当日", 1: "買った次の日"}.get(ask_from, f"買って{ask_from}日目")
-        short = "日持ちが短い食材です。" if ing["fridge_days"] <= 2 else ""
-        wasted_detail.append({
-            "name": ing["name"],
-            "message": f"{ing['name']}は{short}目安は{ing['fridge_days']}日なので、{when}から声をかけます。",
-        })
-
-    return {
-        "week_start": start.isoformat(),
-        "week_end": (start + timedelta(days=5)).isoformat(),  # 土曜のふり返りなので表示は土曜まで
-        "wasted": wasted,
-        "wasted_detail": wasted_detail,
-        "saved": saved,
-        "saved_names": list(dict.fromkeys(s["name"] for s in saved)),
-        "protected_days": len(protected),
-    }
+def freezer_state(inv, ing, today):
+    frozen_on = parse_date(inv.get("frozen_at") or inv.get("updated_at") or inv["purchased_at"])
+    frozen_days = (today - frozen_on).days
+    left = (ing.get("freezer_days") or 14) - frozen_days
+    return frozen_on, frozen_days, left
 
 
 # ---------------- 冷蔵庫の中身（画面0b） ----------------
 
 def fridge_view(inventory, ingredients, today):
-    """冷蔵にあるものを期限の目安が近い順に。冷凍したものは別の欄に。"""
+    """冷蔵は期限の目安が近い順。冷凍庫は冷凍した日と日数（冷凍の目安が近いと早めに）。"""
     order = {ing_id: i for i, ing_id in enumerate(ingredients)}
     fridge = []
     for inv in inventory:
@@ -209,7 +170,7 @@ def fridge_view(inventory, ingredients, today):
             "state": d["freshness"],
             "state_label": d["freshness_label"],
             "days_left": d["days_left"],
-            "_key": urgency_key(inv, ing, today, order),  # 同じ日数なら消費期限の食品 → 購入日 → 食材表の順
+            "_key": urgency_key(inv, ing, today, order),
         })
     fridge.sort(key=lambda x: x.pop("_key"))
 
@@ -218,57 +179,99 @@ def fridge_view(inventory, ingredients, today):
         if inv["status"] != "frozen":
             continue
         ing = ingredients[inv["ingredient_id"]]
-        frozen_on = (inv.get("updated_at") or inv["purchased_at"])[:10]
+        frozen_on, frozen_days, left = freezer_state(inv, ing, today)
+        st = freshness(left)
         freezer.append({
             "inventory_id": inv["id"],
             "name": ing["name"],
-            "frozen_at": frozen_on,
-            "use_by": (parse_date(frozen_on) + timedelta(days=FREEZER_USE_DAYS)).isoformat(),
+            "frozen_at": frozen_on.isoformat(),
+            "frozen_days": frozen_days,
+            "days_left": left,
+            "state": st,
+            "state_label": STATUS_LABEL[st],
         })
-    freezer.sort(key=lambda x: x["use_by"])
+    freezer.sort(key=lambda x: x["days_left"])
     return {"fridge": fridge, "freezer": freezer}
 
 
 # ---------------- 料理の提案（画面0b・6） ----------------
 
 def suggestions(inventory, ingredients, dishes, today, limit=MAX_SUGGESTIONS):
-    """使う食材がすべて冷蔵にあり、うち1つ以上が soon の料理を、soon の食材を多く使う順に。"""
-    states = {}
+    """使う食材がすべて冷蔵か冷凍にあり、うち1つ以上が soon の料理。
+    冷凍した食材を使う料理を先に、次に soon を多く使う順（同じなら調理時間が短い順）。
+    uses の "naganegi|negi" は「どちらか一方があればよい」。"""
+    have = {}  # ingredient_id -> {"state": ..., "frozen": bool}
     for inv in inventory:
-        if inv["status"] != "stocked":
+        ing = ingredients[inv["ingredient_id"]]
+        if inv["status"] == "stocked":
+            st = freshness(days_left(inv, ing, today))
+            if st == "past":
+                continue  # 目安を過ぎたものを使う料理は勧めない
+            frozen = False
+        elif inv["status"] == "frozen":
+            st = freshness(freezer_state(inv, ing, today)[2])
+            frozen = True
+        else:
             continue
-        st = freshness(days_left(inv, ingredients[inv["ingredient_id"]], today))
-        if st == "past":
-            continue  # 目安を過ぎたものを使う料理は勧めない
-        prev = states.get(inv["ingredient_id"])
-        states[inv["ingredient_id"]] = "soon" if "soon" in (prev, st) else st
+        cur = have.get(ing["id"])
+        if cur is None or st == "soon" or (frozen and not cur["frozen"]):
+            have[ing["id"]] = {"state": st if cur is None or st == "soon" else cur["state"],
+                               "frozen": frozen or (cur or {}).get("frozen", False)}
 
     picked = []
     for i, dish in enumerate(dishes):
-        if not all(u in states for u in dish["uses"]):
-            continue
-        n_soon = sum(1 for u in dish["uses"] if states[u] == "soon")
-        if n_soon == 0:
-            continue
-        picked.append((-n_soon, dish["time_minutes"], i, dish))
-    picked.sort(key=lambda x: x[:3])
+        chosen = []
+        for use in dish["uses"]:
+            ok = next((u for u in use.split("|") if u in have), None)
+            if ok is None:
+                break
+            chosen.append(ok)
+        else:
+            n_soon = sum(1 for u in chosen if have[u]["state"] == "soon")
+            if n_soon == 0:
+                continue
+            n_frozen = sum(1 for u in chosen if have[u]["frozen"])
+            picked.append((-min(n_frozen, 1), -n_soon, dish["time_minutes"], i, dish, chosen))
+    picked.sort(key=lambda x: x[:4])
+
+    def label(u):
+        return ingredients[u]["name"] + ("（冷凍）" if have[u]["frozen"] else "")
+
     return [{
         "id": d["id"],
         "name": d["name"],
         "time_minutes": d["time_minutes"],
-        "uses": [ingredients[u]["name"] for u in d["uses"]],
-        "soon_uses": [ingredients[u]["name"] for u in d["uses"] if states[u] == "soon"],
+        "uses": [label(u) for u in chosen],
+        "soon_uses": [label(u) for u in chosen if have[u]["state"] == "soon"],
         "url": COOKPAD_SEARCH + quote(d["search_query"]),
-    } for *_, d in picked[:limit]]
+    } for *_, d, chosen in picked[:limit]]
 
 
-# ---------------- 今週のカード（ホーム） ----------------
+# ---------------- 今週のカード（ホーム・5d） ----------------
 
-def weekly_card(inventory, ingredients, asks, freeze_checks, today):
-    w = weekly(inventory, ingredients, asks, freeze_checks, today)
-    return {
-        "week_start": w["week_start"],
-        "wasted_count": len(w["wasted"]),
-        "saved_count": len(w["saved"]),
-        "protected_days": w["protected_days"],
-    }
+def week_range(today):
+    start = today - timedelta(days=today.weekday())  # 月曜はじまり
+    return start, start + timedelta(days=6)
+
+
+def weekly_card(inventory, ingredients, today):
+    """守れた品：今週、was_soon の在庫が frozen か used になった品数。
+    間に合わなかった品：今週、目安日数を過ぎても used/frozen/gone にならなかった品数（「捨てた」とは書かない）。"""
+    start, end = week_range(today)
+
+    def in_week(d):
+        return d is not None and start <= d <= end
+
+    saved = missed = 0
+    for inv in inventory:
+        ing = ingredients[inv["ingredient_id"]]
+        if inv["status"] in ("frozen", "used") and inv.get("was_soon"):
+            changed = parse_date(inv.get("frozen_at") or inv.get("updated_at") or inv["purchased_at"])
+            if in_week(changed):
+                saved += 1
+        elif inv["status"] in ("stocked", "wasted") and tracked(ing):
+            lim = limit_date(inv, ing)
+            if lim is not None and lim < today and in_week(lim + timedelta(days=1)):
+                missed += 1
+    return {"week_start": start.isoformat(), "saved_count": saved, "missed_count": missed,
+            "has_records": bool(saved or missed)}

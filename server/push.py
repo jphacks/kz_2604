@@ -40,12 +40,13 @@ class Push:
             serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
         self.public_key = base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
-    def send(self, subscriptions, title, body, url="/"):
-        """全端末に送る。もう使えない購読（404/410）の endpoint を返す。"""
+    def send(self, subscriptions, message):
+        """message（title, body, url, 通知のボタン用の kind・date・device_id など）を、
+        その端末の購読すべてに送る。もう使えない購読（404/410）の endpoint を返す。"""
         dead = []
         if not self.available:
             return dead
-        payload = json.dumps({"title": title, "body": body, "url": url}, ensure_ascii=False)
+        payload = json.dumps(message, ensure_ascii=False)
         for sub in subscriptions:
             try:
                 webpush(sub, payload, vapid_private_key=self._vapid,
