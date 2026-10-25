@@ -71,6 +71,7 @@ function names(list) { return list.join("・"); }
 function title(text) { return `<h1>${text.split("\n").map(l => `<span class="br">${esc(l)}</span>`).join("")}</h1>`; }
 
 const ICON = {
+  folder: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6.5A1.5 1.5 0 0 1 4.5 5H9l2 2.5h8.5A1.5 1.5 0 0 1 21 9v9.5a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 18.5z"/></svg>`,
   camera: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>`,
   fridge: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2.5" width="14" height="19" rx="2.5"/><path d="M5 10h14M9 6v2M9 13v3"/></svg>`,
   snow: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 2v20M3.3 7l17.4 10M3.3 17L20.7 7"/><path d="M9 4l3 2 3-2M9 20l3-2 3 2M4 10.5l3.4-.3L6 7M20 13.5l-3.4.3L18 17M4 13.5l3.4.3L6 17M20 10.5l-3.4-.3L18 7"/></svg>`,
@@ -81,6 +82,7 @@ const ICON = {
 };
 
 function show(v) {
+  if (v !== "camera") stopCamera();
   view = v;
   render();
   window.scrollTo(0, 0);
@@ -556,25 +558,75 @@ function renderReceipt(error) {
   pick.onchange = () => onFile(pick);
 }
 
-// ホームの「レシートを撮る」：押したらすぐカメラを開く（click は押した処理の中で同期して呼ぶ。でないとブラウザが開かせない）。
-// 入力欄は画面の外に1つだけ置く（カメラを開いている間にホームが描き直されても、撮った画像を受け取れるように）。
-// 撮らずに閉じたらホームのまま。画像を開けなかったときだけ撮影画面（「写真から選ぶ」もある）に移る
-let cameraInput = null;
+// ホームの「レシートを撮る」：押したらすぐアプリの中のカメラを開く（getUserMedia）。
+// 端末のカメラアプリの画面には手を入れられないので、右下に「フォルダから選ぶ」を置くために自前で映す。
+// カメラが使えない（許可されない・HTTPSでない）ときは、端末のカメラ（capture）に切り替える
+let cameraStream = null;
+let fileInputs = {};
+
+function fileInput(kind) {  // 画面の外に1つずつ置く（描き直されても、選んだ画像を受け取れるように）
+  if (fileInputs[kind]) return fileInputs[kind];
+  const input = Object.assign(document.createElement("input"), { type: "file", accept: "image/*", hidden: true });
+  if (kind === "camera") input.setAttribute("capture", "environment");
+  document.body.appendChild(input);
+  input.onchange = async () => {
+    const f = input.files[0];
+    input.value = "";  // 同じ写真をもう一度選んでも change が出るように
+    if (!f) return;
+    stopCamera();
+    view = "receipt";
+    try { readReceipt(await imageFileToCanvas(f)); }
+    catch (e) { renderReceipt("画像を開けませんでした"); }
+  };
+  return fileInputs[kind] = input;
+}
+
+function stopCamera() {
+  if (cameraStream) cameraStream.getTracks().forEach(t => t.stop());
+  cameraStream = null;
+}
+
 function openCamera() {
-  if (!cameraInput) {
-    cameraInput = Object.assign(document.createElement("input"), { type: "file", accept: "image/*", hidden: true });
-    cameraInput.setAttribute("capture", "environment");
-    document.body.appendChild(cameraInput);
-    cameraInput.onchange = async () => {
-      const f = cameraInput.files[0];
-      cameraInput.value = "";  // 同じ写真をもう一度選んでも change が出るように
-      if (!f) return;
-      view = "receipt";
-      try { readReceipt(await imageFileToCanvas(f)); }
-      catch (e) { renderReceipt("画像を開けませんでした"); }
-    };
-  }
-  cameraInput.click();
+  if (!navigator.mediaDevices?.getUserMedia) { fileInput("camera").click(); return; }
+  view = "camera";
+  document.body.dataset.view = view;
+  app.innerHTML = `
+    <div class="cam">
+      <video id="cam-video" autoplay playsinline muted></video>
+      <div class="cam-guide"><span class="corner tl"></span><span class="corner tr"></span><span class="corner bl"></span><span class="corner br"></span></div>
+      <p class="cam-msg" id="cam-msg">レシート全体が入るように、まっすぐ撮ってください</p>
+      <div class="cam-bar">
+        <button class="cam-side" id="cam-close">やめる</button>
+        <button class="cam-shutter" id="cam-shoot" aria-label="撮影する" disabled></button>
+        <button class="cam-side" id="cam-pick">${ICON.folder}<span>フォルダから選ぶ</span></button>
+      </div>
+    </div>`;
+  const video = document.getElementById("cam-video");
+  const shoot = document.getElementById("cam-shoot");
+  document.getElementById("cam-close").onclick = () => { stopCamera(); show("home"); };
+  document.getElementById("cam-pick").onclick = () => fileInput("pick").click();
+  shoot.onclick = () => {
+    if (!video.videoWidth) return;
+    const c = document.createElement("canvas");
+    c.width = video.videoWidth; c.height = video.videoHeight;
+    c.getContext("2d").drawImage(video, 0, 0);
+    stopCamera();
+    view = "receipt";
+    readReceipt(c);
+  };
+  navigator.mediaDevices.getUserMedia({
+    video: { facingMode: { ideal: "environment" }, width: { ideal: 3840 }, height: { ideal: 2160 } }, audio: false,
+  }).then(stream => {
+    if (view !== "camera") { stream.getTracks().forEach(t => t.stop()); return; }
+    cameraStream = stream;
+    video.srcObject = stream;
+    video.onloadedmetadata = () => { shoot.disabled = false; };
+  }).catch(() => {
+    if (view !== "camera") return;
+    document.getElementById("cam-msg").textContent = "カメラを使えませんでした。端末のカメラで撮るか、フォルダから選んでください。";
+    shoot.disabled = false;
+    shoot.onclick = () => fileInput("camera").click();
+  });
 }
 
 function imageFileToCanvas(f) {
@@ -1047,6 +1099,7 @@ async function render() {
     else if (view === "fridge") await renderFridge(seq);
     else if (view === "settings") await renderSettings(seq);
     else if (view === "receipt") renderReceipt();
+    else if (view === "camera") return;  // カメラの画面は openCamera() が描く（描き直すと映像が止まる）
     else if (view === "confirm") renderConfirm();
     else if (view === "ask") renderAsk();
     else if (view === "action") renderAction();
