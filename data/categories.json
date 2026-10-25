@@ -1,0 +1,146 @@
+[
+ {
+  "id": "ground_poultry",
+  "label": "ひき肉・鶏肉",
+  "fridge_days": 1,
+  "freezable": true,
+  "track_expiry": true,
+  "source": "FoodSafety.gov「Cold Food Storage Chart」（1〜2日）／冷凍：農林水産省 消費者の部屋「ホームフリージングする際の注意点について教えてください。」"
+ },
+ {
+  "id": "sliced_meat",
+  "label": "豚・牛・羊の肉",
+  "fridge_days": 2,
+  "freezable": true,
+  "track_expiry": true,
+  "source": "FoodSafety.gov「Cold Food Storage Chart」（ステーキ・チョップ3〜5日）＋独自判断（薄切りは短く）／冷凍：農林水産省 消費者の部屋「ホームフリージングする際の注意点について教えてください。」"
+ },
+ {
+  "id": "fish",
+  "label": "生の魚",
+  "fridge_days": 1,
+  "freezable": true,
+  "track_expiry": true,
+  "source": "FoodSafety.gov「Cold Food Storage Chart」（1〜3日）／冷凍：農林水産省 消費者の部屋「ホームフリージングする際の注意点について教えてください。」"
+ },
+ {
+  "id": "shellfish",
+  "label": "エビ・カニ・貝・いか・たこ",
+  "fridge_days": 2,
+  "freezable": true,
+  "track_expiry": true,
+  "source": "FoodSafety.gov「Cold Food Storage Chart」（カニ2〜4日、エビ3〜5日）／冷凍：農林水産省 消費者の部屋「ホームフリージングする際の注意点について教えてください。」"
+ },
+ {
+  "id": "raw_sausage",
+  "label": "生ソーセージ",
+  "fridge_days": 1,
+  "freezable": true,
+  "track_expiry": true,
+  "source": "FoodSafety.gov「Cold Food Storage Chart」（1〜2日）／冷凍：農林水産省 消費者の部屋「ホームフリージングする際の注意点について教えてください。」"
+ },
+ {
+  "id": "processed_meat",
+  "label": "ハム・ウインナーなど（開封後）",
+  "fridge_days": 3,
+  "freezable": true,
+  "track_expiry": true,
+  "source": "FoodSafety.gov「Cold Food Storage Chart」（開封後3〜5日）／冷凍：農林水産省 消費者の部屋「ホームフリージングする際の注意点について教えてください。」"
+ },
+ {
+  "id": "bacon",
+  "label": "ベーコン",
+  "fridge_days": 7,
+  "freezable": true,
+  "track_expiry": true,
+  "source": "FoodSafety.gov「Cold Food Storage Chart」（1週間）／冷凍：農林水産省 消費者の部屋「ホームフリージングする際の注意点について教えてください。」"
+ },
+ {
+  "id": "cooked",
+  "label": "調理済み・惣菜・残り物",
+  "fridge_days": 3,
+  "freezable": true,
+  "track_expiry": true,
+  "source": "FoodSafety.gov「Cold Food Storage Chart」（3〜4日）／冷凍：農林水産省 消費者の部屋「ホームフリージングする際の注意点について教えてください。」（調理済みのおかずは向く）"
+ },
+ {
+  "id": "leafy",
+  "label": "葉物野菜・香味野菜",
+  "fridge_days": 3,
+  "freezable": false,
+  "track_expiry": true,
+  "source": "目黒区「野菜を上手に保存しておいしく食べきろう！」（小松菜 約3日）／冷凍：農林水産省 消費者の部屋「ホームフリージングする際の注意点について教えてください。」（水分の多い生野菜は向かない）"
+ },
+ {
+  "id": "cabbage_lettuce",
+  "label": "キャベツ・レタス・白菜",
+  "fridge_days": 14,
+  "freezable": false,
+  "track_expiry": true,
+  "source": "目黒区「野菜を上手に保存しておいしく食べきろう！」（約2週間）／冷凍：農林水産省 消費者の部屋「ホームフリージングする際の注意点について教えてください。」（水分の多い生野菜は向かない）"
+ },
+ {
+  "id": "root",
+  "label": "根菜",
+  "fridge_days": 7,
+  "freezable": false,
+  "track_expiry": true,
+  "source": "目黒区「野菜を上手に保存しておいしく食べきろう！」（大根 約10日、ごぼう 約1週間）／冷凍：農林水産省 消費者の部屋「ホームフリージングする際の注意点について教えてください。」"
+ },
+ {
+  "id": "fruit_veg",
+  "label": "実もの野菜",
+  "fridge_days": 7,
+  "freezable": false,
+  "track_expiry": true,
+  "source": "農林水産省 aff 2020年7月号「夏野菜＆果物の保存術」（なす1週間、トマト7〜10日など）／冷凍：農林水産省 消費者の部屋「ホームフリージングする際の注意点について教えてください。」"
+ },
+ {
+  "id": "sprouts_cut",
+  "label": "もやし・カット野菜",
+  "fridge_days": 2,
+  "freezable": false,
+  "track_expiry": true,
+  "source": "公的な出典なし（独自判断）／冷凍：農林水産省 消費者の部屋「ホームフリージングする際の注意点について教えてください。」（水分の多い生野菜は向かない）"
+ },
+ {
+  "id": "mushroom",
+  "label": "きのこ",
+  "fridge_days": null,
+  "freezable": false,
+  "track_expiry": true,
+  "source": "公的な出典が見つからないため、パッケージの期限を優先（未入力なら判定しない）"
+ },
+ {
+  "id": "fruit",
+  "label": "果物",
+  "fridge_days": null,
+  "freezable": false,
+  "track_expiry": true,
+  "source": "分類としての出典なし。パッケージの期限を優先（未入力なら判定しない）"
+ },
+ {
+  "id": "package_date",
+  "label": "豆腐・卵・乳製品・練り物など",
+  "fridge_days": null,
+  "freezable": false,
+  "track_expiry": true,
+  "source": "パッケージの期限を優先（未入力なら判定しない）／冷凍：農林水産省 消費者の部屋「ホームフリージングする際の注意点について教えてください。」（豆腐・卵・牛乳などは向かない）"
+ },
+ {
+  "id": "bread_rice",
+  "label": "パン・ごはん・麺・もち",
+  "fridge_days": null,
+  "freezable": true,
+  "track_expiry": true,
+  "source": "パッケージの期限を優先（未入力なら判定しない）／冷凍：農林水産省 消費者の部屋「ホームフリージングする際の注意点について教えてください。」（パン・ご飯・もちは向く）"
+ },
+ {
+  "id": "shelf_stable",
+  "label": "常温のもの・調味料・乾物・缶詰・市販の冷凍食品",
+  "fridge_days": null,
+  "freezable": false,
+  "track_expiry": false,
+  "source": "期限を判定しない（料理の提案にだけ使う）"
+ }
+]

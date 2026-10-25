@@ -1,0 +1,70 @@
+[
+ {
+  "line": "*贅を味わう麻婆豆腐の",
+  "expected": "mabo_moto"
+ },
+ {
+  "line": "*ﾌｰﾄﾞﾆｱ白きざみねぎ",
+  "expected": "food_0544"
+ },
+ {
+  "line": "*A&木綿とうふ150gx3",
+  "expected": "food_0653"
+ },
+ {
+  "line": "国産豚コマ切落",
+  "expected": "pork_koma"
+ },
+ {
+  "line": "もやし",
+  "expected": "moyashi"
+ },
+ {
+  "line": "たまご10コ",
+  "expected": "egg"
+ },
+ {
+  "line": "キャベツ1/2",
+  "expected": "food_0459"
+ },
+ {
+  "line": "絹とうふ",
+  "expected": "food_0654"
+ },
+ {
+  "line": "若鶏もも肉",
+  "expected": "chicken_thigh"
+ },
+ {
+  "line": "焼肉のたれ",
+  "expected": "food_0876"
+ },
+ {
+  "line": "ﾊﾞﾅﾅ",
+  "expected": "food_0579"
+ },
+ {
+  "line": "牛乳1000ml",
+  "expected": "food_0669"
+ },
+ {
+  "line": "酢豚",
+  "expected": "food_0302"
+ },
+ {
+  "line": "黒酢",
+  "expected": null
+ },
+ {
+  "line": "ﾐﾆﾄﾏﾄ",
+  "expected": "food_0496"
+ },
+ {
+  "line": "たこ焼き",
+  "expected": "food_0314"
+ },
+ {
+  "line": "ボックスティッシュ",
+  "expected": null
+ }
+]

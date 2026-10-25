@@ -1,0 +1,22 @@
+{
+  "maff_home_freezing": {
+    "name": "農林水産省 消費者の部屋「ホームフリージングする際の注意点について教えてください。」",
+    "url": "https://www.maff.go.jp/j/heya/sodan/1810/01.html",
+    "used_for": "冷凍の目安（2〜3週間以内に使い切る → 短い方の14日）と、冷凍に向く・向かない"
+  },
+  "foodsafety_chart": {
+    "name": "FoodSafety.gov「Cold Food Storage Chart」（米国政府）",
+    "url": "https://www.foodsafety.gov/food-safety-charts/cold-food-storage-charts",
+    "used_for": "肉・魚・調理済みの冷蔵の目安"
+  },
+  "meguro_vegetables": {
+    "name": "目黒区「野菜を上手に保存しておいしく食べきろう！」",
+    "url": "https://www.city.meguro.tokyo.jp/recycle/kurashi/gomi/hozonhouhou.html",
+    "used_for": "葉物・キャベツ・根菜の冷蔵の目安"
+  },
+  "maff_aff_summer": {
+    "name": "農林水産省 aff 2020年7月号「夏野菜＆果物の保存術」",
+    "url": "https://www.maff.go.jp/j/pr/aff/2007/spe1_05.html",
+    "used_for": "実もの野菜の冷蔵の目安"
+  }
+}

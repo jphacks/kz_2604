@@ -1,0 +1,16 @@
+{
+  "name": "冷蔵コーチ",
+  "short_name": "冷蔵コーチ",
+  "description": "疲れて自炊の予定が崩れた日に、捨てそうな食材を救う行動を1つだけ届ける",
+  "lang": "ja",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f6f3ee",
+  "theme_color": "#2f6f5e",
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
