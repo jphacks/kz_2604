@@ -81,11 +81,17 @@ button svg { width: 20px; height: 20px; flex: none; }
   display: inline-block; font-size: 11px; font-weight: 700; border-radius: 999px;
   padding: 2px 10px; white-space: nowrap;
 }
-.tag.soon { color: var(--soon); background: var(--soon-bg); }
+/* 状態の色（文字のコントラストはすべて 4.5:1 以上） */
+.tag.soon { color: var(--soon); background: var(--soon-bg); }          /* 早めに：橙 5.6:1 */
 .tag.strong { font-size: 12px; padding: 3px 12px; }
-.tag.normal { color: var(--normal); background: var(--normal-bg); }
-.tag.ok { color: var(--ok); background: var(--ok-bg); }
-.tag.past, .tag.none { color: var(--normal); background: var(--normal-bg); }
+.tag.normal { color: #7a5200; background: #fbefc8; }                   /* ふつう：黄 6.0:1 */
+.tag.ok { color: var(--ok); background: var(--ok-bg); }                 /* 余裕あり：緑 5.1:1 */
+.tag.past { color: #fff; background: #b3261e; }                         /* 状態を確認してください：赤 6.5:1 */
+.tag.package, .tag.none { color: var(--normal); background: var(--normal-bg); }  /* 灰 5.4:1 */
+.legend { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 2px; }
+.legend .tag { font-size: 10px; }
+.chip .tag { margin-top: 3px; font-size: 10px; padding: 1px 8px; }
+.chip.selected .tag { box-shadow: 0 0 0 1px rgba(255, 255, 255, .6); }
 
 /* 一覧 */
 .list { background: var(--card); border-radius: var(--radius); padding: 2px 16px; margin: 10px 0; }
@@ -150,8 +156,6 @@ button.choice { background: var(--card); border: 2px solid var(--green); color: 
 .section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .section-head h2 { margin-bottom: 0; }
 .section-head .link { width: auto; margin: 0; }
-.when { font-size: 12px; font-weight: 700; color: var(--normal); white-space: nowrap; }
-.when.soon { color: var(--soon); background: var(--soon-bg); border-radius: 999px; padding: 2px 10px; }
 
 /* 開発者メニュー（ホーム下部にかぶせて出す） */
 .dev-sheet {

@@ -8,10 +8,11 @@ from server.ocr_match import NOT_FOOD, lines_from_ocr_text, match_lines, search
 ROOT = Path(__file__).resolve().parent.parent
 FOODS = {f["id"]: f for f in json.loads((ROOT / "data/foods.json").read_text(encoding="utf-8"))}
 CASES = json.loads((ROOT / "tests/receipt_lines.json").read_text(encoding="utf-8"))
+PANTRY = json.loads((ROOT / "data/excluded.json").read_text(encoding="utf-8"))
 
 
 def match_one(line, learned=None):
-    r = match_lines([{"name": line, "jan": None}], FOODS, learned)
+    r = match_lines([{"name": line, "jan": None}], FOODS, learned, PANTRY)
     return r["matched"][0]["food_id"] if r["matched"] else None
 
 
@@ -21,6 +22,12 @@ class ReceiptLinesTest(unittest.TestCase):
         for case in CASES:
             with self.subTest(line=case["line"]):
                 self.assertEqual(match_one(case["line"]), case["expected"])
+
+    def test_pantry_items_are_not_registered(self):
+        """食材表から取り除いた「冷蔵・冷凍しないもの」は pantry に入り、別の食材に取り違えない"""
+        lines = ["サラダ油", "ごま油", "ツナ缶 3缶", "無洗米5kg"]
+        r = match_lines([{"name": n, "jan": None} for n in lines], FOODS, None, PANTRY)
+        self.assertEqual(([m["raw"] for m in r["matched"]], [p["raw"] for p in r["pantry"]]), ([], ["サラダ油", "ごま油", "ツナ缶 3缶", "無洗米5kg"]))
 
     def test_one_char_keyword_only_whole_name(self):
         self.assertEqual(match_one("卵"), "egg")

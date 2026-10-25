@@ -62,7 +62,10 @@ function fmtDayLong(iso) { const [, m, d] = ymd(iso); return `${m}月${d}日（$
 function fmtShort(iso) { const [, m, d] = ymd(iso); return `${m}/${d}`; }
 function fmtTime(iso) { return iso.split("T")[1].slice(0, 5); }
 function fmtSeconds(s) { return !s ? "" : s < 60 ? `${s}秒` : `${Math.round(s / 60)}分`; }
-function soonBadge(soon) { return soon ? `<span class="tag soon">早めに</span>` : ""; }
+// 状態の色付きバッジ（早めに・ふつう・余裕あり・状態を確認してください・パッケージの期限を見る・期限なし）
+function stateTag(state, label) { return state ? `<span class="tag ${esc(state)}">${esc(label)}</span>` : ""; }
+const LEGEND = `<div class="legend">${[["soon", "早めに"], ["normal", "ふつう"], ["ok", "余裕あり"], ["past", "状態を確認してください"]]
+  .map(([s, l]) => stateTag(s, l)).join("")}</div>`;
 function names(list) { return list.join("・"); }
 // 「おつかれさま。\n今日はこれだけ。」のように改行で区切った見出し
 function title(text) { return `<h1>${text.split("\n").map(l => `<span class="br">${esc(l)}</span>`).join("")}</h1>`; }
@@ -181,7 +184,7 @@ async function renderHome(seq) {
       <div class="section-head"><h2>期限が近い食材</h2><button class="link" id="see-all">すべて見る</button></div>
       <div class="list">${h.near.length ? h.near.map(n => `
           <div class="item"><div class="body"><div class="name">${esc(n.name)}</div></div>
-            <span class="when ${n.soon ? "soon" : ""}">${esc(n.when)}</span></div>`).join("")
+            ${stateTag(n.state, n.when)}</div>`).join("")
         : `<p class="sub" style="padding:12px 0">期限の目安がある食材は、まだありません。</p>`}</div>
       ${noDishes ? `<h2>この食材で作れる料理</h2><p class="sub">今日は料理の提案はお休みです。</p>` : dishesHtml(h.dishes, "この食材で作れる料理")}
       <div class="tiles">
@@ -358,13 +361,13 @@ async function renderFridge(seq) {
   const list = fridgeTab === "fridge" ? inv.fridge : inv.freezer;
   const row = i => {
     const sub = fridgeTab === "fridge"
-      ? `${esc(fmtShort(i.purchased_at))} に購入${i.past ? "・目安を過ぎています。状態を確かめてください" : ""}`
+      ? `${esc(fmtShort(i.purchased_at))} に購入${i.when && !i.past ? `・${esc(i.when)}` : ""}`
       : `冷凍して${i.frozen_days + 1}日目・目安${esc(fmtShort(i.until))}ごろまで`;
     const picked = removing && removing.has(i.inventory_id);
     return removing
       ? `<div class="check-row ${picked ? "on" : ""}" data-id="${esc(i.inventory_id)}" role="checkbox" aria-checked="${picked}" tabindex="0">
-           <span class="box">${picked ? ICON.check : ""}</span><div class="body"><div class="name">${esc(i.name)}</div><div class="raw">${sub}</div></div>${soonBadge(i.soon)}</div>`
-      : `<div class="item"><div class="body"><div class="name">${esc(i.name)}</div><div class="raw">${sub}</div></div>${soonBadge(i.soon)}</div>`;
+           <span class="box">${picked ? ICON.check : ""}</span><div class="body"><div class="name">${esc(i.name)}</div><div class="raw">${sub}</div></div>${stateTag(i.state, i.state_label)}</div>`
+      : `<div class="item"><div class="body"><div class="name">${esc(i.name)}</div><div class="raw">${sub}</div></div>${stateTag(i.state, i.state_label)}</div>`;
   };
   app.innerHTML = `
     <div class="screen">
@@ -374,6 +377,7 @@ async function renderFridge(seq) {
         <button role="tab" class="${fridgeTab === "fridge" ? "on" : ""}" id="tab-fridge" aria-selected="${fridgeTab === "fridge"}">冷蔵（${inv.fridge.length}）</button>
         <button role="tab" class="${fridgeTab === "freezer" ? "on" : ""}" id="tab-freezer" aria-selected="${fridgeTab === "freezer"}">冷凍（${inv.freezer.length}）</button>
       </div>
+      ${LEGEND}
       <div class="list ${removing ? "checks" : ""}">${list.length ? list.map(row).join("")
         : `<p class="sub" style="padding:12px 0">${fridgeTab === "fridge" ? "冷蔵に登録された食材はありません。" : "冷凍した食材はありません。"}</p>`}</div>
       ${fridgeTab === "freezer" ? `<p class="note" style="text-align:left">${esc(inv.freezer_note)}（出典：${esc(inv.freezer_source)}）</p>` : ""}
@@ -720,6 +724,7 @@ function startConfirm(result, reasons = []) {
     matched: result.matched.map(m => ({ ...m, checked: true })),
     unmatched: result.unmatched.map(u => ({ ...u, choice: null })),  // choice：food_id か "not_food"
     not_food: result.not_food || [],
+    pantry: result.pantry || [],     // 油・乾物・缶詰など、冷蔵・冷凍しないもの
     manual: [],      // 手入力で足した食材 {food_id, name, soon}
     query: "", results: [],
   };
@@ -735,7 +740,7 @@ function confirmCount() {
 async function refreshSoon() {
   const ids = [...draft.matched.map(m => m.food_id), ...draft.manual.map(m => m.food_id)];
   const { items } = await api("POST", "/api/inventory/preview", { purchased_at: draft.purchased_at, food_ids: ids });
-  [...draft.matched, ...draft.manual].forEach((m, i) => { m.soon = items[i].soon; });
+  [...draft.matched, ...draft.manual].forEach((m, i) => Object.assign(m, { soon: items[i].soon, state: items[i].state, state_label: items[i].state_label }));
   render();
 }
 
@@ -750,7 +755,7 @@ function renderConfirm() {
           <div class="check-row ${m.checked ? "on" : ""}" data-i="${i}" role="checkbox" aria-checked="${m.checked}" tabindex="0">
             <span class="box">${m.checked ? ICON.check : ""}</span>
             <div class="body"><div class="name">${esc(m.name)}</div><div class="raw">レシート表記：${esc(m.raw)}</div></div>
-            ${soonBadge(m.soon && m.checked)}
+            ${m.checked ? stateTag(m.state, m.state_label) : ""}
           </div>`).join("")
         : `<p class="sub" style="padding:12px 0">認識できた食材はありません。下から選ぶか、追加してください。</p>`}</div>
 
@@ -767,9 +772,10 @@ function renderConfirm() {
           </div>`).join("")}</div>` : ""}
 
       ${draft.not_food.length ? `<p class="sub">前に「食材ではない」を選んだ行：${draft.not_food.map(x => esc(x.raw)).join("、")}</p>` : ""}
+      ${draft.pantry.length ? `<p class="sub">冷蔵・冷凍しないもの（登録しません）：${draft.pantry.map(x => esc(x.raw)).join("、")}</p>` : ""}
 
       ${draft.manual.length ? `<h2>追加した食材</h2><div class="list">${draft.manual.map((m, i) => `
-          <div class="item"><div class="body"><div class="name">${esc(m.name)}</div></div>${soonBadge(m.soon)}
+          <div class="item"><div class="body"><div class="name">${esc(m.name)}</div></div>${stateTag(m.state, m.state_label)}
             <button class="use" data-rm="${i}">外す</button></div>`).join("")}</div>` : ""}
 
       <h2>読み取れなかった食材を追加</h2>
@@ -954,7 +960,7 @@ async function renderCook(seq) {
       <div class="chips">
         ${cook.items.length ? cook.items.map(i => `
           <button class="chip ${cook.selected.has(i.inventory_id) ? "selected" : ""}" data-id="${esc(i.inventory_id)}" aria-pressed="${cook.selected.has(i.inventory_id)}">
-            <span>${esc(i.name)}</span><small>${i.frozen ? "冷凍" : esc(fmtShort(i.purchased_at))}${i.soon ? "・早めに" : ""}</small>
+            <span>${esc(i.name)}</span><small>${i.frozen ? "冷凍" : esc(fmtShort(i.purchased_at))}</small>${stateTag(i.state, i.state_label)}
           </button>`).join("") : `<p class="sub">登録された食材はありません。</p>`}
       </div>
       ${dishesHtml(sug.dishes, "何を作るか迷ったら（期限が近い順・時間は目安）")}

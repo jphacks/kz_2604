@@ -44,6 +44,30 @@ def is_soon(left):
     return left is not None and 0 <= left <= GRACE_DAYS
 
 
+NORMAL_MAX_DAYS = 2     # 残り日数がこれ以下なら「ふつう」、超えたら「余裕あり」
+STATE_LABEL = {"soon": "早めに", "normal": "ふつう", "ok": "余裕あり", "past": "状態を確認してください",
+               "package": "パッケージの期限を見る", "none": "期限なし"}
+
+
+def state_of(left, food):
+    """色付きの表示に使う状態。soon（早めに）／normal（ふつう）／ok（余裕あり）／past（状態を確認してください）
+    package（パッケージの期限を優先する食材で、期限が入っていない）／none（常温など、期限を判定しない）"""
+    if left is None:
+        return "package" if food.get("track_expiry", True) else "none"
+    if left < 0:
+        return "past"
+    if left <= GRACE_DAYS:
+        return "soon"
+    if left <= NORMAL_MAX_DAYS:
+        return "normal"
+    return "ok"
+
+
+def state_fields(left, food):
+    st = state_of(left, food)
+    return {"state": st, "state_label": STATE_LABEL[st]}
+
+
 def freezer_state(inv, food, today):
     frozen_on = parse_date(inv.get("frozen_at") or inv.get("updated_at") or inv["purchased_at"])
     days = food.get("freezer_days") or FREEZER_DAYS
@@ -53,7 +77,7 @@ def freezer_state(inv, food, today):
 
 def when_label(left):
     if left < 0:
-        return "状態を確かめてください"
+        return "状態を確認してください"
     return {0: "今日まで", 1: "明日まで"}.get(left, f"あと{left}日")
 
 
@@ -136,9 +160,10 @@ def cook_items(inventory, foods, today):
     out = []
     for inv in items:
         food = foods[inv["food_id"]]
-        soon = inv["status"] == "stocked" and is_soon(days_left(inv, food, today))
+        left = days_left(inv, food, today) if inv["status"] == "stocked" else freezer_state(inv, food, today)[3]
+        soon = inv["status"] == "stocked" and is_soon(left)
         out.append({"inventory_id": inv["id"], "name": food["name"], "purchased_at": inv["purchased_at"],
-                    "frozen": inv["status"] == "frozen", "soon": soon, "checked": soon})
+                    "frozen": inv["status"] == "frozen", "soon": soon, "checked": soon, **state_fields(left, food)})
     return out
 
 
@@ -153,10 +178,12 @@ def near_items(inventory, foods, today, limit=3):
             left = days_left(inv, food, today)
             if left is None:
                 continue
-            rows.append((left, inv["purchased_at"], {"name": food["name"], "when": when_label(left), "soon": is_soon(left)}))
+            rows.append((left, inv["purchased_at"], {"name": food["name"], "when": when_label(left), "soon": is_soon(left),
+                                                     **state_fields(left, food)}))
         elif inv["status"] == "frozen":
             left = freezer_state(inv, food, today)[3]
-            rows.append((left, inv["purchased_at"], {"name": f"{food['name']}（冷凍）", "when": when_label(left), "soon": is_soon(left)}))
+            rows.append((left, inv["purchased_at"], {"name": f"{food['name']}（冷凍）", "when": when_label(left),
+                                                     "soon": is_soon(left), **state_fields(left, food)}))
     rows.sort(key=lambda r: r[:2])
     return [r[2] for r in rows[:limit]]
 
@@ -169,12 +196,12 @@ def fridge_view(inventory, foods, today):
             left = days_left(inv, food, today)
             fridge.append({"inventory_id": inv["id"], "name": food["name"], "purchased_at": inv["purchased_at"],
                            "days_left": left, "soon": is_soon(left), "past": left is not None and left < 0,
-                           "when": when_label(left) if left is not None else None})
+                           "when": when_label(left) if left is not None else None, **state_fields(left, food)})
         elif inv["status"] == "frozen":
             frozen_on, frozen_days, until, left = freezer_state(inv, food, today)
             freezer.append({"inventory_id": inv["id"], "name": food["name"], "frozen_at": frozen_on.isoformat(),
                             "frozen_days": frozen_days, "until": until.isoformat(), "soon": is_soon(left),
-                            "days_left": left})
+                            "days_left": left, **state_fields(left, food)})
     big = 10 ** 6
     fridge.sort(key=lambda x: (x["days_left"] if x["days_left"] is not None else big, x["purchased_at"]))
     freezer.sort(key=lambda x: x["days_left"])

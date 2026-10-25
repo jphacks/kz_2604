@@ -950,6 +950,7 @@ ITEMS["shelf_stable"] = """
 """
 
 from extra import EXTRA
+from exclude import EXCLUDE
 for _k, _v in EXTRA.items():
     ITEMS[_k] = ITEMS.get(_k, "") + "\n" + _v
 
@@ -1011,6 +1012,14 @@ def main(out_dir):
                 "quick_use": None, "core": False,
             })
             seq += 1
+    # 明らかに冷蔵・冷凍で保存しない品目を取り除く（番号を振ったあとなので、残った品目の id は変わらない）
+    unknown = EXCLUDE - {f["name"] for f in foods}
+    if unknown:
+        errors.append(f"exclude.py にあるが食材表にない品目: {sorted(unknown)}")
+    # 取り除いた品目の名前とキーワードは excluded.json に残す。照合で「冷蔵・冷凍しないもの」と分かるように
+    # （残すと「サラダ油」が「サラダ（惣菜）」に当たる、といった取り違えを防ぐ）
+    excluded = [{"name": f["name"], "keywords": f["keywords"]} for f in foods if f["name"] in EXCLUDE]
+    foods = [f for f in foods if f["name"] not in EXCLUDE]
     # duplicates
     names = Counter(f["name"] for f in foods)
     for n, k in names.items():
@@ -1030,6 +1039,7 @@ def main(out_dir):
     cats_out = [{"id": k, **v} for k, v in CATEGORIES.items()]
     json.dump(foods, open(f"{out_dir}/foods.json", "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
     json.dump(cats_out, open(f"{out_dir}/categories.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    json.dump(excluded, open(f"{out_dir}/excluded.json", "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
     print("total", len(foods))
     for k, v in by_cat.items():
         print(f"  {k}: {v}")

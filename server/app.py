@@ -59,6 +59,7 @@ def load_json(rel):
 FOODS = {f["id"]: f for f in load_json("data/foods.json")}
 CATEGORIES = {c["id"]: c for c in load_json("data/categories.json")}
 DISHES = load_json("data/dishes.json")
+PANTRY = load_json("data/excluded.json")  # 食材表から取り除いた「冷蔵・冷凍しないもの」（照合で見分けるのに使う）
 
 
 def food_source(food):
@@ -110,11 +111,20 @@ def initial_state():
             "devices": {}, "records": []}
 
 
+def drop_unknown_foods(st):
+    """食材表から取り除いた品目（tools/exclude.py）を指す在庫は、読み込むときに消す。"""
+    for dev in st["devices"].values():
+        dev["inventory"] = [inv for inv in dev["inventory"] if inv["food_id"] in FOODS]
+        if dev["today"].get("rescue") and dev["today"]["rescue"]["food_id"] not in FOODS:
+            dev["today"] = new_today(logic.parse_date(dev["today"]["date"]))
+    return st
+
+
 def read_state():
     if STATE_FILE.exists():
         st = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         if st.get("version") == STATE_VERSION:
-            return st
+            return drop_unknown_foods(st)
         # 前の形式（食材表が変わる前）のファイルは使わない（新しく始める）
     st = initial_state()
     write_state(st)
@@ -283,11 +293,11 @@ def api_receipts(ctx, body):
         extra = {"provider": read["engine"], "model": read["model"],
                  "transcript": "\n".join(l["name"] + (f"  [{l['jan']}]" if l["jan"] else "") for l in read["lines"])}
     purchased_at = read.get("purchased_at") or today.isoformat()
-    result = match_lines(read["lines"], FOODS, dev["learned"])
+    result = match_lines(read["lines"], FOODS, dev["learned"], PANTRY)
     for m in result["matched"]:
         food = FOODS[m["food_id"]]
-        m["name"] = food["name"]
-        m["soon"] = logic.is_soon(logic.days_left({"purchased_at": purchased_at}, food, today))
+        left = logic.days_left({"purchased_at": purchased_at}, food, today)
+        m.update({"name": food["name"], "soon": logic.is_soon(left), **logic.state_fields(left, food)})
     for u in result["unmatched"]:
         u["candidates"] = [{"id": c, "name": FOODS[c]["name"]} for c in u["candidates"]]
     return {"purchased_at": purchased_at, **result, "engine": engine, **extra}
@@ -301,8 +311,8 @@ def api_preview(ctx, body):
         food = FOODS.get(fid)
         if not food:
             raise ApiError(400, f"食材表にないid: {fid}")
-        out.append({"food_id": fid, "name": food["name"],
-                    "soon": logic.is_soon(logic.days_left({"purchased_at": body["purchased_at"]}, food, today))})
+        left = logic.days_left({"purchased_at": body["purchased_at"]}, food, today)
+        out.append({"food_id": fid, "name": food["name"], "soon": logic.is_soon(left), **logic.state_fields(left, food)})
     return {"items": out}
 
 

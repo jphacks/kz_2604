@@ -8,6 +8,8 @@
 4. 共通の除外語（の素・たれ・ソース・ドレッシング）を含む行は、track_expiry: true の生鮮食材には当てない
 5. 当たらない行は unmatched に入れ、候補（candidates）を付ける
 学習した対応には「食材ではない」（NOT_FOOD）も入る。その行は not_food に入れる。
+食材表から取り除いた「冷蔵・冷凍しないもの」（data/excluded.json：油・乾物・缶詰など）に当たった行は pantry に入れる
+（キーワード照合と同じ長い順に比べるので、「サラダ油」が「サラダ（惣菜）」に当たらない）。
 """
 import re
 import unicodedata
@@ -43,13 +45,21 @@ def clean_raw(line):
     return re.sub(r"\s{2,}", " ", raw)
 
 
-def _keywords(ingredients):
+PANTRY = "__pantry__"
+
+
+def _keywords(ingredients, pantry=()):
     out = []
     for ing in ingredients.values():
         for kw in ing["keywords"]:
             n = normalize(kw)
             if n:
                 out.append((n, ing["id"]))
+    for item in pantry:
+        for kw in item["keywords"]:
+            n = normalize(kw)
+            if n:
+                out.append((n, PANTRY))
     out.sort(key=lambda x: -len(x[0]))  # 長いキーワードから先に（「麻婆豆腐」を「豆腐」より先に）
     return out
 
@@ -58,7 +68,7 @@ def _keyword_match(norm, ingredients, keywords):
     excluded = any(normalize(w) in norm for w in EXCLUDE_WORDS)
     for kw, ing_id in keywords:
         hit = (kw == norm) if len(kw) == 1 else (kw in norm)
-        if hit and not (excluded and ingredients[ing_id]["track_expiry"]):
+        if hit and (ing_id == PANTRY or not (excluded and ingredients[ing_id]["track_expiry"])):
             return ing_id
     return None
 
@@ -95,13 +105,13 @@ def candidates(norm, ingredients):
     return [ing_id for _, ing_id in scored[:MAX_CANDIDATES]]
 
 
-def match_lines(lines, ingredients, learned=None):
+def match_lines(lines, ingredients, learned=None, pantry=()):
     """lines: [{"name": 品名, "jan": JANコード or None}]（LLMの文字起こし）
     learned: {"names": {正規化した品名: id or NOT_FOOD}, "jans": {JAN: id or NOT_FOOD}}（端末ごとに学習した対応）"""
     learned = learned or {}
     names, jans = learned.get("names", {}), learned.get("jans", {})
-    keywords = _keywords(ingredients)
-    matched, unmatched, not_food = [], [], []
+    keywords = _keywords(ingredients, pantry)
+    matched, unmatched, not_food, pantry_lines = [], [], [], []
     for i, line in enumerate(lines, 1):
         raw = clean_raw(line.get("name"))
         norm = normalize(raw)
@@ -120,11 +130,14 @@ def match_lines(lines, ingredients, learned=None):
         else:
             ing_id = _keyword_match(norm, ingredients, keywords)
             by = "keyword" if ing_id else None
+        if ing_id == PANTRY:
+            pantry_lines.append({"line_id": line_id, "raw": raw, "jan": jan})
+            continue
         if ing_id:
             matched.append({"line_id": line_id, "food_id": ing_id, "raw": raw, "jan": jan, "by": by})
         else:
             unmatched.append({"line_id": line_id, "raw": raw, "jan": jan, "candidates": candidates(norm, ingredients)})
-    return {"matched": matched, "unmatched": unmatched, "not_food": not_food}
+    return {"matched": matched, "unmatched": unmatched, "not_food": not_food, "pantry": pantry_lines}
 
 
 def search(q, ingredients, limit=10):
