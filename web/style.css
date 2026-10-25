@@ -108,12 +108,13 @@ button svg { width: 20px; height: 20px; flex: none; }
   display: flex; align-items: center; cursor: default;
   /* 3秒長押しで開発者メニュー。長押し中に文字選択やブラウザのメニューが出ないように */
   user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; touch-action: manipulation;
-  transition: opacity .2s;
+  transition: opacity .2s; white-space: nowrap; flex: none;
 }
 .appname.pressing { opacity: .5; }
 .notify-chip {
   width: auto; min-height: var(--tap); margin: 0; padding: 6px 14px; font-size: 12px; font-weight: 700;
   background: var(--card); border: none; color: var(--green); gap: 6px;
+  flex: 0 1 auto; text-align: left; line-height: 1.35;
 }
 .notify-chip.off { color: var(--sub); }
 .notify-chip svg { width: 18px; height: 18px; }
@@ -142,8 +143,53 @@ button svg { width: 20px; height: 20px; flex: none; }
 .wk .sep { color: var(--line); }
 .wk .quiet { color: var(--sub); }
 
-/* 開発者メニュー */
-.card.dev { border: 1.5px dashed #cfc8b9; background: transparent; }
+/* 2択（［作る］［今日は無理］は同じ大きさ・同じ見た目） */
+button.choice { background: var(--card); border: 2px solid var(--green); color: var(--green); }
+.ask-card .choice { background: var(--bg); }
+
+.section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.section-head h2 { margin-bottom: 0; }
+.section-head .link { width: auto; margin: 0; }
+.when { font-size: 12px; font-weight: 700; color: var(--normal); white-space: nowrap; }
+.when.soon { color: var(--soon); background: var(--soon-bg); border-radius: 999px; padding: 2px 10px; }
+
+/* 開発者メニュー（ホーム下部にかぶせて出す） */
+.dev-sheet {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 20; max-height: 70vh; overflow: auto;
+  background: var(--card); border-top: 1px solid var(--line); box-shadow: 0 -8px 24px rgba(0, 0, 0, .12);
+  border-radius: 20px 20px 0 0; padding-bottom: env(safe-area-inset-bottom);
+}
+.dev-inner { max-width: 440px; margin: 0 auto; padding: 8px 20px 16px; }
+.ok-msg { color: var(--ok); background: var(--ok-bg); border-radius: 12px; padding: 8px 12px; font-size: 13px; }
+
+/* 冷蔵庫の中身のタブ */
+.tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; background: var(--beige); border-radius: 999px; padding: 4px; margin: 6px 0 4px; }
+.tabs button { margin: 0; min-height: var(--tap); border: none; background: transparent; color: var(--sub); }
+.tabs button.on { background: var(--card); color: var(--ink); }
+
+/* 画面2：認識できなかった行の候補（チップを1タップで選ぶ） */
+.unmatched { padding: 10px 0; border-bottom: 1px solid var(--line); }
+.unmatched:last-child { border-bottom: none; }
+.unmatched .raw-line { font-size: 14px; font-weight: 700; margin-bottom: 6px; overflow-wrap: anywhere; }
+.chips-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.cand { width: auto; margin: 0; min-height: var(--tap); padding: 6px 14px; font-size: 13px; border: 1.5px solid var(--line); }
+.cand.on { background: var(--green); border-color: var(--green); color: #fff; }
+.cand.ghost { color: var(--sub); }
+.cand.ghost.on { background: var(--normal); border-color: var(--normal); color: #fff; }
+.search input {
+  width: 100%; font: inherit; font-size: 16px; color: inherit; background: var(--card); border: 1px solid var(--line);
+  border-radius: 12px; padding: 10px 12px; min-height: var(--tap);
+}
+.results { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.result { width: auto; margin: 0; min-height: var(--tap); padding: 6px 14px; font-size: 13px; }
+.date-pick { display: flex; flex-direction: column; gap: 4px; cursor: pointer; }
+.date-pick input { font: inherit; font-size: 14px; color: var(--ink); background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 6px 8px; min-height: var(--tap); width: fit-content; }
+
+/* 画面0c */
+.switch-row input[type="checkbox"] { width: 26px; height: 26px; accent-color: var(--green); }
+.time-row .fixed { font-size: 16px; font-weight: 700; color: var(--sub); }
+
+/* 開発者メニュー（ボタン） */
 .dev-buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .dev-buttons button { min-height: var(--tap); font-size: 12px; font-weight: 500; border-radius: 12px; margin: 0; padding: 8px; }
 .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 12px 0; }

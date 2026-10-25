@@ -1,10 +1,10 @@
 // Service Worker：Webプッシュを受けて通知を出す（冷蔵コーチ）。
-// 問いかけには［作る］［無理］、リマインドには［入れた］［あとで］のボタンを付ける（2つまで）。
-// ボタンが出ない端末（iPhoneなど）や通知の本体がタップされたときは、問いかけは画面3b、リマインドは画面5bを開く。
+// 問いかけには［作る］［今日は無理］、確認には［入れた］［あとで］のボタンを付ける（2つまで）。
+// ボタンが出ない端末（iPhoneなど）や通知の本体がタップされたときは、問いかけは画面3b、確認は画面5bを開く。
 // Service Worker は localStorage を読めないので、端末ごとのIDは通知の中身（device_id）から使う。
 
 const ACTIONS = {
-  ask: [{ action: "cook", title: "作る" }, { action: "skip", title: "無理" }],
+  ask: [{ action: "cook", title: "作る" }, { action: "skip", title: "今日は無理" }],
   remind: [{ action: "done", title: "入れた" }, { action: "later", title: "あとで" }],
 };
 
@@ -55,7 +55,7 @@ self.addEventListener("notificationclick", event => {
   event.waitUntil((async () => {
     try {
       if (data.kind === "ask" && (event.action === "cook" || event.action === "skip")) {
-        // 通知のボタンで答えた。「無理」は救済行動（画面4）、「作る」は使った食材（画面6）を開く
+        // 通知のボタンで答えた。［今日は無理］は救済行動（画面4）、［作る］は使った食材を選ぶ画面（画面6）を開く
         await post(data, "/api/answer", { date: data.date, answer: event.action, taps: 1, via: "notification" });
         return openApp(event.action === "skip" ? "action" : "cook");
       }
@@ -65,7 +65,7 @@ self.addEventListener("notificationclick", event => {
           ? { title: "救えました。", body: "今日はもう何もしなくて大丈夫。ゆっくり休んでください。" }
           : res.reask_at
             ? { title: "了解。", body: `${fmtTime(res.reask_at)}に、もう一度だけ聞きます。それで今日はおしまい。` }
-            : { title: "了解。", body: "今日はここまでにします。返事がなくても大丈夫です。" };
+            : { title: "了解。", body: "今日はこれでおしまい。" };
         return self.registration.showNotification(msg.title, {
           body: msg.body, icon: "/icons/icon-192.png", badge: "/icons/icon-192.png", tag: "reizo-remind", data: {},
         });

@@ -4,7 +4,8 @@
 
 - データはすべて端末ごとのID（ヘッダー X-Device-Id）で分ける。IDがないリクエストは 400
 - 時刻はサーバーが持つ「デモ用の時計」で進む（実時間と同じ速さで進み、/api/debug/advance で先に進められる）
-- 問いかけ・締め切り・冷凍のリマインド・再通知はすべてサーバーが処理する（15秒ごとに確認）
+- 問いかけ・締め切り・確認・再通知はすべてサーバーが処理する（15秒ごとに確認）
+- 端末ごとに「今日の状態」（today_state）を持つ：unanswered / skip_pending / done / cook / none
 """
 import csv
 import io
@@ -19,10 +20,10 @@ import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from . import logic
-from .ocr_match import lines_from_ocr_text, match_lines, normalize
+from .ocr_match import NOT_FOOD, lines_from_ocr_text, match_lines, normalize, search
 from .push import Push
 from .receipt import ReceiptError, read_receipt
 from .receipt import engine as receipt_engine
@@ -30,6 +31,7 @@ from .receipt import engine as receipt_engine
 ROOT = Path(__file__).resolve().parent.parent
 WEB = ROOT / "web"
 STATE_FILE = ROOT / "var" / "state.json"
+STATE_VERSION = 3
 JST = timezone(timedelta(hours=9))
 DEMO_START = datetime(2026, 10, 26, 19, 0, tzinfo=JST)  # 月曜、買い物から帰ったところ
 DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")
@@ -54,8 +56,13 @@ def load_json(rel):
     return json.loads((ROOT / rel).read_text(encoding="utf-8"))
 
 
-INGREDIENTS = {ing["id"]: ing for ing in load_json("data/ingredients.json")}
+FOODS = {f["id"]: f for f in load_json("data/foods.json")}
+CATEGORIES = {c["id"]: c for c in load_json("data/categories.json")}
 DISHES = load_json("data/dishes.json")
+
+
+def food_source(food):
+    return food.get("source") or CATEGORIES.get(food["category"], {}).get("source", "")
 
 
 class ApiError(Exception):
@@ -67,28 +74,48 @@ class ApiError(Exception):
 
 # ---------------- 状態と時計 ----------------
 
-def new_device():
+def new_today(d):
+    return {
+        "date": d.isoformat(),
+        "state": None,          # None の間は食材から決める（unanswered か none）。答えたら固定する
+        "answer": None,         # skip / cook
+        "answered_by": None,    # user / timeout
+        "ask_sent": False,
+        "rescue": None,         # 救済行動
+        "note": None,           # 「もやしは冷凍に向かないので…」
+        "remind_at": None,
+        "remind_sent": False,
+        "reask_at": None,
+        "reask_count": 0,
+        "freeze_pending": False,  # 確認の通知を送って、返事を待っている
+        "cook_recorded": False,
+        "no_deadline": False,   # 開発者メニューでリセットした日は、締め切りで「今日は無理」にしない
+    }
+
+
+def new_device(today):
     return {
         "inventory": [],
         "next_inv": 1,
-        "asks": {},           # 日付 -> 問いかけ
-        "freeze_checks": {},  # 日付 -> 冷凍のリマインド
-        "settings": {"ask_time": logic.DEFAULT_ASK_TIME, "remind_time": logic.DEFAULT_REMIND_TIME},
+        "settings": dict(logic.DEFAULT_SETTINGS),
+        "today": new_today(today),
+        "pending_cook_record": None,  # 「あとで記録する」を選んだ日。翌日のホームで1回だけ聞く
         "push_subscriptions": [],
         "learned": {"names": {}, "jans": {}},
     }
 
 
 def initial_state():
-    return {"clock_offset": (DEMO_START - datetime.now(JST)).total_seconds(), "devices": {}, "records": []}
+    return {"version": STATE_VERSION, "clock_offset": (DEMO_START - datetime.now(JST)).total_seconds(),
+            "devices": {}, "records": []}
 
 
 def read_state():
     if STATE_FILE.exists():
         st = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        if "devices" in st:
+        if st.get("version") == STATE_VERSION:
             return st
-        # 端末ごとのIDより前の形式のファイルは使わない（新しく始める）
+        # 前の形式（食材表が変わる前）のファイルは使わない（新しく始める）
     st = initial_state()
     write_state(st)
     return st
@@ -114,89 +141,91 @@ def emit(st, dev_id, message):
 
 
 def record(st, dev_id, type_, **fields):
-    """試用の記録（実証用）。type：ask_sent / answered / remind_sent / remind_answered"""
+    """試用の記録（実証用）。type：ask_sent / answered / remind_sent / remind_answered / rescue"""
     st["records"].append({"device_id": dev_id, "type": type_, "at": now(st).isoformat(), **fields})
 
 
-# ---------------- 問いかけと冷凍のリマインド ----------------
-
-def make_ask(st, dev_id, dev, d, asked_at, send=True):
-    reason = logic.should_ask(dev["inventory"], INGREDIENTS, d)["reason_items"]
-    dev["asks"][d.isoformat()] = {
-        "date": d.isoformat(),
-        "asked_at": asked_at.isoformat(),
-        # 返事の締め切りはリマインドの時刻。返事がなければ「無理」として、そのままリマインドを送る
-        # （リマインドの文だけで何をすればいいか分かるので、通知は1日3回までに収まる）
-        "deadline": at_time(d, dev["settings"]["remind_time"]).isoformat(),
-        "items": reason,
-        "answer": None,
-        "answered_by": None,
-    }
-    if send:
-        names = "・".join(reason)
-        emit(st, dev_id, {"kind": "ask", "date": d.isoformat(), "title": "今日、作れそう？",
-                          "body": f"{names}を、そろそろ使いたい日です。返事しなくても大丈夫。", "url": "/?open=ask"})
-        record(st, dev_id, "ask_sent", date=d.isoformat())
+def notify_enabled(dev):
+    return bool(dev["settings"].get("notify", True) and dev["push_subscriptions"])
 
 
-def apply_skip(st, dev, d):
-    """「無理」（または返事なし）を受けて救済行動を1つ決め、冷凍を指示した日だけリマインドを予約する。"""
-    key = d.isoformat()
-    ask = dev["asks"][key]
-    action = logic.choose_action(dev["inventory"], INGREDIENTS, d)
-    ask["action"] = action
-    ask["acked"] = False  # 画面4で「わかった」を押すまで、開いたら画面4を出す
-    dev["freeze_checks"].pop(key, None)
-    remind_at = None
-    if action and action["kind"] == "freeze":
-        remind_at = max(at_time(d, dev["settings"]["remind_time"]), now(st))
-        dev["freeze_checks"][key] = {
-            "date": key,
-            "inventory_id": action["inventory_id"],
-            "status": "scheduled",  # remind_at になったら pending にして通知
-            "remind_at": remind_at.isoformat(),
-            "reask_at": None,
-            "reask_count": 0,
-        }
-    ask["remind_at"] = remind_at.isoformat() if remind_at else None
-    return action
+def ensure_today(dev, today):
+    if dev["today"]["date"] != today.isoformat():
+        dev["today"] = new_today(today)
 
 
-def remind_message(dev, fc):
-    view = freeze_check_view(dev, fc)
-    return {"kind": "remind", "date": fc["date"], "title": f"{view['name']}、冷凍庫に入れた？",
-            "body": f"まだなら、{view['how']}だけ（{view['seconds']}秒）。", "url": "/?open=remind"}
+def today_state(dev, today):
+    t = dev["today"]
+    if t["state"]:
+        return t["state"]
+    return "unanswered" if logic.should_ask(dev["inventory"], FOODS, today) else "none"
+
+
+# ---------------- 「今日は無理」と確認 ----------------
+
+def apply_skip(st, dev, d, by):
+    """「今日は無理」（または締め切りまで返事なし）。救済行動を1つ決めて skip_pending にする。
+    救済行動にできる食材がなければ、行動は出さず done（確認の通知も送らない）。"""
+    t = dev["today"]
+    action, note = logic.choose_rescue(dev["inventory"], FOODS, d)
+    t.update({"answer": "skip", "answered_by": by, "rescue": action, "note": note})
+    if action:
+        t["state"] = "skip_pending"
+        remind = at_time(d, dev["settings"]["remind_time"])
+        t["remind_at"] = remind.isoformat() if now(st) < remind else None
+    else:
+        t["state"] = "done"
+        t["remind_at"] = None
+    return action, note
+
+
+def remind_message(dev):
+    a = dev["today"]["rescue"]
+    return {"kind": "remind", "date": dev["today"]["date"],
+            "title": f"{a['text']}（{a['seconds']}秒）", "body": "入れたら、ボタンを押すだけでOK。", "url": "/?open=remind"}
+
+
+def finish_rescue(st, dev, status):
+    """救済行動の対象の在庫を frozen / used / gone にして、今日はおしまいにする。"""
+    t = dev["today"]
+    inv = find_inv(dev, t["rescue"]["inventory_id"])
+    set_status(st, inv, status)
+    t.update({"state": "done", "result": status, "remind_at": None, "reask_at": None, "freeze_pending": False})
+    return inv
 
 
 def tick_device(st, dev_id, dev, t):
     today = t.date()
-    key = today.isoformat()
-    logic.mark_was_soon(dev["inventory"], INGREDIENTS, today)
+    ensure_today(dev, today)
+    logic.mark_was_soon(dev["inventory"], FOODS, today)
+    td, s = dev["today"], dev["settings"]
+    state = today_state(dev, today)
 
-    # 問いかけ（早めの食材がある日だけ、端末ごとの時刻に）
-    ask_at = at_time(today, dev["settings"]["ask_time"])
-    remind_at = at_time(today, dev["settings"]["remind_time"])
-    if key not in dev["asks"] and ask_at <= t < remind_at:
-        if logic.should_ask(dev["inventory"], INGREDIENTS, today)["should_ask"]:
-            make_ask(st, dev_id, dev, today, ask_at)
+    # 問いかけ（早めの食材があって、まだ答えていない日だけ）
+    if state == "unanswered" and not td["ask_sent"] and at_time(today, s["ask_time"]) <= t < at_time(today, s["deadline_time"]):
+        td["ask_sent"] = True
+        if notify_enabled(dev):
+            names = "・".join(logic.soon_names(dev["inventory"], FOODS, today))
+            emit(st, dev_id, {"kind": "ask", "date": today.isoformat(), "title": "今日、作れそう？",
+                              "body": f"{names}を、そろそろ使いたい日です。返事しなくても大丈夫。", "url": "/?open=ask"})
+            record(st, dev_id, "ask_sent", date=today.isoformat())
 
-    # 返事の締め切り（リマインドの時刻）を過ぎたら skip
-    for d, ask in dev["asks"].items():
-        if ask["answer"] is None and t >= datetime.fromisoformat(ask["deadline"]):
-            ask["answer"] = "skip"
-            ask["answered_by"] = "timeout"
-            apply_skip(st, dev, logic.parse_date(d))
+    # 締め切りまでに返事がなければ「今日は無理」
+    if state == "unanswered" and not td.get("no_deadline") and t >= at_time(today, s["deadline_time"]):
+        apply_skip(st, dev, today, "timeout")
 
-    # 冷凍のリマインドと、「あとで」の1時間後の再通知（1回だけ）
-    for fc in dev["freeze_checks"].values():
-        due = (fc["status"] == "scheduled" and t >= datetime.fromisoformat(fc["remind_at"])) or \
-              (fc["status"] == "later" and t >= datetime.fromisoformat(fc["reask_at"]))
-        if due:
-            fc["status"] = "pending"
-            fc["reask_at"] = None
-            fc["sent_at"] = t.isoformat()
-            emit(st, dev_id, remind_message(dev, fc))
-            record(st, dev_id, "remind_sent", date=fc["date"], again=fc.get("reask_count", 0) > 0)
+    # 確認（skip_pending の日だけ）と、「あとで」の1時間後の再通知（1回だけ）
+    if td["state"] == "skip_pending":
+        due_remind = td["remind_at"] and not td["remind_sent"] and t >= datetime.fromisoformat(td["remind_at"])
+        due_reask = td["reask_at"] and t >= datetime.fromisoformat(td["reask_at"])
+        if due_remind or due_reask:
+            if due_remind:
+                td["remind_sent"] = True
+            td["reask_at"] = None
+            td["freeze_pending"] = True
+            if notify_enabled(dev):
+                emit(st, dev_id, remind_message(dev))
+                record(st, dev_id, "remind_sent", date=td["date"], again=bool(due_reask))
 
 
 def tick(st):
@@ -219,50 +248,22 @@ def set_status(st, inv, status):
         inv["frozen_at"] = now(st).date().isoformat()
 
 
-def freeze_check_view(dev, fc):
-    inv = next((i for i in dev["inventory"] if i["id"] == fc["inventory_id"]), None)
-    ing = INGREDIENTS[inv["ingredient_id"]] if inv else {}
-    # 「袋のまま冷凍庫へ」→「袋のまま入れる」（「まだなら、袋のまま入れるだけ」の形にする）
-    how = (ing.get("freeze_action") or "冷凍庫へ").replace("冷凍庫へ", "入れる")
-    return {**fc, "name": ing.get("name", ""), "how": how,
-            "seconds": ing.get("freeze_seconds") or 30,
-            "can_reask": fc.get("reask_count", 0) < logic.MAX_REASK}
-
-
-def current_screen(st, dev):
-    """今日の分で、いま画面に出すべきもの（4：救済行動、5b：冷凍庫に入れた？）。"""
-    key = now(st).date().isoformat()
-    ask = dev["asks"].get(key)
-    fc = dev["freeze_checks"].get(key)
-    if fc and fc["status"] == "pending":
-        return {"screen": "freeze_check", "today_ask": ask, "freeze_check": freeze_check_view(dev, fc)}
-    if ask and ask["answer"] == "skip" and not ask.get("acked", True):
-        return {"screen": "action", "today_ask": ask}
-    return {"screen": None, "today_ask": ask}
-
-
 def weekly(st, dev):
-    return logic.weekly_card(dev["inventory"], INGREDIENTS, now(st).date())
+    return logic.weekly_card(dev["inventory"], FOODS, now(st).date())
+
+
+def frozen_until(st, food_id):
+    days = FOODS[food_id].get("freezer_days") or logic.FREEZER_DAYS
+    return (now(st).date() + timedelta(days=days)).isoformat()
 
 
 # ---------------- API ----------------
 
-def preview_item(ingredient_id, purchased_at, today, expiry_override=None):
-    ing = INGREDIENTS.get(ingredient_id)
-    if not ing:
-        raise ApiError(400, f"食材表にないid: {ingredient_id}")
-    d = logic.describe({"purchased_at": purchased_at, "expiry_override": expiry_override}, ing, today)
-    return {"ingredient_id": ingredient_id, "name": ing["name"], "freshness": d["freshness"],
-            "freshness_label": d["freshness_label"], "days_left": d["days_left"], "limit_date": d["limit_date"]}
-
-
 def api_receipts(ctx, body):
     st, dev = ctx["st"], ctx["dev"]
     today = now(st).date()
-    extra = {}
     if body.get("use_fixture"):
-        read = load_json("fixtures/receipt_demo.json")
-        engine, extra = "fixture", {}
+        read, engine, extra = load_json("fixtures/receipt_demo.json"), "fixture", {}
     elif body.get("ocr_text") is not None:
         read = lines_from_ocr_text(body["ocr_text"])  # 予備：端末の Tesseract.js で読んだ文字
         if not read["lines"]:
@@ -280,156 +281,216 @@ def api_receipts(ctx, body):
             raise ApiError(502, str(e))
         engine = "llm"
         extra = {"provider": read["engine"], "model": read["model"],
-                 "transcript": "\n".join(f"{l['name']}" + (f"  [{l['jan']}]" if l["jan"] else "") for l in read["lines"])}
+                 "transcript": "\n".join(l["name"] + (f"  [{l['jan']}]" if l["jan"] else "") for l in read["lines"])}
     purchased_at = read.get("purchased_at") or today.isoformat()
-    result = match_lines(read["lines"], INGREDIENTS, dev["learned"])
+    result = match_lines(read["lines"], FOODS, dev["learned"])
     for m in result["matched"]:
-        m.update(preview_item(m["ingredient_id"], purchased_at, today))
+        food = FOODS[m["food_id"]]
+        m["name"] = food["name"]
+        m["soon"] = logic.is_soon(logic.days_left({"purchased_at": purchased_at}, food, today))
     for u in result["unmatched"]:
-        u["candidates"] = [{"id": c, "name": INGREDIENTS[c]["name"]} for c in u["candidates"]]
+        u["candidates"] = [{"id": c, "name": FOODS[c]["name"]} for c in u["candidates"]]
     return {"purchased_at": purchased_at, **result, "engine": engine, **extra}
 
 
 def api_preview(ctx, body):
+    """画面2で選んだ食材・購入日について「早めに」かどうかを返す。"""
     today = now(ctx["st"]).date()
-    return {"items": [preview_item(it["ingredient_id"], body["purchased_at"], today, it.get("expiry_override"))
-                      for it in body.get("items", [])]}
+    out = []
+    for fid in body.get("food_ids", []):
+        food = FOODS.get(fid)
+        if not food:
+            raise ApiError(400, f"食材表にないid: {fid}")
+        out.append({"food_id": fid, "name": food["name"],
+                    "soon": logic.is_soon(logic.days_left({"purchased_at": body["purchased_at"]}, food, today))})
+    return {"items": out}
 
 
 def api_confirm(ctx, body):
-    """チェックした品目を在庫に登録し、自分で選んだ行（learn: true）の対応を覚える。"""
+    """チェックした品目を在庫に登録し、自分で選んだ行（learn: true）の対応を覚える（「食材ではない」も）。"""
     st, dev = ctx["st"], ctx["dev"]
     added = []
     for it in body.get("items", []):
-        if it["ingredient_id"] not in INGREDIENTS:
-            raise ApiError(400, f"食材表にないid: {it['ingredient_id']}")
+        fid = it.get("food_id")
+        target = NOT_FOOD if it.get("not_food") else fid
+        if not it.get("not_food") and fid not in FOODS:
+            raise ApiError(400, f"食材表にないid: {fid}")
         if it.get("learn"):
             if it.get("raw") and normalize(it["raw"]):
-                dev["learned"]["names"][normalize(it["raw"])] = it["ingredient_id"]
+                dev["learned"]["names"][normalize(it["raw"])] = target
             if it.get("jan"):
-                dev["learned"]["jans"][it["jan"]] = it["ingredient_id"]
-        inv = {
-            "id": f"inv_{dev['next_inv']:03d}",
-            "ingredient_id": it["ingredient_id"],
-            "raw": it.get("raw", ""),
-            "purchased_at": body["purchased_at"],
-            "frozen_at": None,
-            "expiry_override": it.get("expiry_override") or None,
-            "status": "stocked",
-            "was_soon": False,
-            "updated_at": now(st).isoformat(),
-        }
+                dev["learned"]["jans"][it["jan"]] = target
+        if it.get("not_food"):
+            continue
+        inv = {"id": f"inv_{dev['next_inv']:03d}", "food_id": fid, "raw": it.get("raw", ""),
+               "purchased_at": body["purchased_at"], "frozen_at": None,
+               "expiry_override": it.get("expiry_override") or None,
+               "status": "stocked", "was_soon": False, "updated_at": now(st).isoformat()}
         dev["next_inv"] += 1
         dev["inventory"].append(inv)
         added.append(inv["id"])
-    logic.mark_was_soon(dev["inventory"], INGREDIENTS, now(st).date())
+    logic.mark_was_soon(dev["inventory"], FOODS, now(st).date())
     return {"added": added}
+
+
+def api_foods_search(ctx, body):
+    return {"foods": search(body.get("q", ""), FOODS, limit=10)}
+
+
+def bell(dev, state):
+    s, td = dev["settings"], dev["today"]
+    on = notify_enabled(dev)
+    if state == "unanswered":
+        label = f"今日は{s['ask_time']}に聞きます"
+    elif state == "skip_pending":
+        if td["reask_at"]:
+            label = f"{td['reask_at'][11:16]}にもう一度だけ聞きます"
+        elif td["remind_at"] and not td["remind_sent"]:
+            label = f"{td['remind_at'][11:16]}に1回だけ聞きます"
+        else:
+            label = "今日の通知はおしまい"
+    elif state in ("done", "cook"):
+        label = "今日の通知はおしまい"
+    else:
+        label = "今日は通知なし"
+    if not on and state in ("unanswered", "skip_pending") and label != "今日の通知はおしまい":
+        label = "通知はオフ（開いたときに聞きます）"  # 許可していないのに「18:00に聞きます」と出さない
+    return {"label": label, "notify_enabled": on, "quiet": label in ("今日は通知なし", "今日の通知はおしまい")}
 
 
 def api_home(ctx, body):
     st, dev = ctx["st"], ctx["dev"]
     t = now(st)
     today = t.date()
-    ask_today = dev["asks"].get(today.isoformat())
-    q = logic.should_ask(dev["inventory"], INGREDIENTS, today)
-    answered = bool(ask_today and ask_today["answer"])
-    items = ask_today["items"] if ask_today and ask_today.get("items") else q["reason_items"]
+    td = dev["today"]
+    state = today_state(dev, today)
+    card = {"items": logic.soon_names(dev["inventory"], FOODS, today)}
+    if td["rescue"]:
+        card["action"] = td["rescue"]
+        card["until"] = frozen_until(st, td["rescue"]["food_id"])
+    card.update({"note": td["note"], "result": td.get("result"), "cook_recorded": td["cook_recorded"],
+                 "deadline": dev["settings"]["deadline_time"], "remind_time": dev["settings"]["remind_time"]})
+    pending = dev["pending_cook_record"]
     return {
         "now": t.isoformat(),
-        "ask": {"show": q["should_ask"] and not answered, "items": items, "answered": answered,
-                "date": today.isoformat()},
-        "notify_today": {"will_notify": q["should_ask"] and not answered, "time": dev["settings"]["ask_time"]},
+        "today_state": state,
+        "card": card,
+        "bell": bell(dev, state),
+        "near": logic.near_items(dev["inventory"], FOODS, today, 3),
+        "dishes": [] if state in ("skip_pending", "done")
+                  else logic.suggestions(dev["inventory"], FOODS, DISHES, today, logic.HOME_DISHES),
         "weekly": weekly(st, dev),
-        **current_screen(st, dev),
+        "yesterday_cook": bool(pending and pending < today.isoformat()),
+        "freeze_pending": td["freeze_pending"],
     }
 
 
 def api_inventory(ctx, body):
-    return logic.fridge_view(ctx["dev"]["inventory"], INGREDIENTS, now(ctx["st"]).date())
+    return logic.fridge_view(ctx["dev"]["inventory"], FOODS, now(ctx["st"]).date())
+
+
+def api_inventory_remove(ctx, body):
+    reason = body.get("reason")
+    if reason not in ("used", "gone"):
+        raise ApiError(400, "reason は used か gone")
+    for inv_id in body.get("inventory_ids", []):
+        set_status(ctx["st"], find_inv(ctx["dev"], inv_id), reason)
+    return {"ok": True}
 
 
 def api_suggestions(ctx, body):
-    return {"dishes": logic.suggestions(ctx["dev"]["inventory"], INGREDIENTS, DISHES, now(ctx["st"]).date())}
+    limit = int(body.get("limit") or logic.LIST_DISHES)
+    return {"dishes": logic.suggestions(ctx["dev"]["inventory"], FOODS, DISHES, now(ctx["st"]).date(), limit)}
 
 
 def api_answer(ctx, body):
     st, dev, dev_id = ctx["st"], ctx["dev"], ctx["dev_id"]
-    d = logic.parse_date(body.get("date") or now(st).date().isoformat())
-    key = d.isoformat()
+    today = now(st).date()
     answer = body.get("answer")
     if answer not in ("skip", "cook"):
         raise ApiError(400, "answer は skip か cook")
-    if key not in dev["asks"]:
-        make_ask(st, dev_id, dev, d, now(st), send=False)  # ホームのカードから、通知より先に答えたとき
-    ask = dev["asks"][key]
-    if ask["answer"] is None or ask["answered_by"] == "timeout":
-        record(st, dev_id, "answered", date=key, value=answer, taps=int(body.get("taps") or 1),
-               via=body.get("via") or "screen")
-    ask["answer"] = answer
-    ask["answered_by"] = "user"
+    td = dev["today"]
+    if td["answer"] and td["answered_by"] == "user":
+        raise ApiError(409, "今日はもう答えています")  # その日に答えたら、その日はもう聞かない
+    record(st, dev_id, "answered", date=today.isoformat(), value=answer,
+           taps=int(body.get("taps") or 1), via=body.get("via") or "screen")
     if answer == "skip":
-        action = apply_skip(st, dev, d)
-        return {"action": action, "remind_at": ask["remind_at"]}
-    return {"items": logic.cook_items(dev["inventory"], INGREDIENTS, d)}
+        action, note = apply_skip(st, dev, today, "user")
+        return {"action": action, "not_freezable_note": note, "remind_at": td["remind_at"]}
+    td.update({"answer": "cook", "answered_by": "user", "state": "cook"})
+    return {"items": logic.cook_items(dev["inventory"], FOODS, today)}
 
 
-def api_action_ack(ctx, body):
-    ask = ctx["dev"]["asks"].get(body.get("date") or now(ctx["st"]).date().isoformat())
-    if not ask:
-        raise ApiError(404, "この日の救済行動はありません")
-    ask["acked"] = True
-    return {"remind_at": ask.get("remind_at")}
-
-
-def api_action_already_used(ctx, body):
-    """画面4「〇〇はもう使った」。在庫から消して、救済行動を選び直す。"""
-    st, dev = ctx["st"], ctx["dev"]
-    d = logic.parse_date(body.get("date") or now(st).date().isoformat())
-    ask = dev["asks"][d.isoformat()]
-    set_status(st, find_inv(dev, ask["action"]["inventory_id"]), "used")
-    action = apply_skip(st, dev, d)
-    return {"action": action, "remind_at": ask["remind_at"]}
+def api_rescue(ctx, body):
+    """画面4・ホームのカード：done_now（入れた・今やった）／later（あとでやる）／already_used（もう使った）"""
+    st, dev, dev_id = ctx["st"], ctx["dev"], ctx["dev_id"]
+    td = dev["today"]
+    if not td["rescue"] or td["state"] not in ("skip_pending",):
+        raise ApiError(409, "今日の救済行動はありません")
+    result = body.get("result")
+    if result not in ("done_now", "later", "already_used"):
+        raise ApiError(400, "result は done_now / later / already_used")
+    record(st, dev_id, "rescue", date=td["date"], value=result, taps=1, via=body.get("via") or "screen")
+    if result == "done_now":
+        inv = finish_rescue(st, dev, "frozen")
+        return {"until": frozen_until(st, inv["food_id"]), "weekly": weekly(st, dev), "name": FOODS[inv["food_id"]]["name"]}
+    if result == "already_used":
+        finish_rescue(st, dev, "used")
+        return {"weekly": weekly(st, dev)}
+    return {"remind_at": td["remind_at"]}  # skip_pending のまま、確認の時刻に1回だけ聞く
 
 
 def api_freeze_check(ctx, body):
     st, dev, dev_id = ctx["st"], ctx["dev"], ctx["dev_id"]
-    key = body.get("date") or next((k for k, v in sorted(dev["freeze_checks"].items(), reverse=True)
-                                    if v["status"] in ("pending", "later", "scheduled")), None)
-    fc = dev["freeze_checks"].get(key) if key else None
-    if not fc:
-        raise ApiError(404, "確認待ちの「冷凍庫に入れた？」はありません")
+    td = dev["today"]
+    if td["state"] != "skip_pending" or not td["rescue"]:
+        raise ApiError(409, "確認待ちの「冷凍庫に入れた？」はありません")
     answer = body.get("answer")
     if answer not in ("done", "later", "gone"):
         raise ApiError(400, "answer は done / later / gone")
-    record(st, dev_id, "remind_answered", date=key, value=answer, taps=int(body.get("taps") or 1),
-           via=body.get("via") or "screen")
-    inv = find_inv(dev, fc["inventory_id"])
+    record(st, dev_id, "remind_answered", date=td["date"], value=answer,
+           taps=int(body.get("taps") or 1), via=body.get("via") or "screen")
     if answer == "done":
-        set_status(st, inv, "frozen")
-        fc["status"] = "done"
-        return {"weekly": weekly(st, dev), "name": INGREDIENTS[inv["ingredient_id"]]["name"]}
-    if answer == "later":
-        if fc.get("reask_count", 0) >= logic.MAX_REASK:
-            fc["status"] = "dropped"  # 2回目の「あとで」。その日はおしまい
-            return {"reask_at": None}
-        reask = now(st) + timedelta(minutes=logic.REASK_MINUTES)
-        fc["status"] = "later"
-        fc["reask_at"] = reask.isoformat()
-        fc["reask_count"] = fc.get("reask_count", 0) + 1
-        return {"reask_at": reask.isoformat()}
-    set_status(st, inv, "gone")
-    fc["status"] = "gone"
-    return {"weekly": weekly(st, dev)}
-
-
-def api_use(ctx, body):
-    for inv_id in body.get("inventory_ids", []):
-        set_status(ctx["st"], find_inv(ctx["dev"], inv_id), "used")
-    return {"ok": True}
+        inv = finish_rescue(st, dev, "frozen")
+        return {"until": frozen_until(st, inv["food_id"]), "weekly": weekly(st, dev), "name": FOODS[inv["food_id"]]["name"]}
+    if answer == "gone":
+        finish_rescue(st, dev, "gone")
+        return {"weekly": weekly(st, dev)}
+    td["freeze_pending"] = False
+    reask = now(st) + timedelta(minutes=logic.REASK_MINUTES)
+    last = at_time(now(st).date(), logic.LAST_REASK)
+    if td["reask_count"] >= logic.MAX_REASK or reask > last:
+        return {"reask_at": None}  # 2回目、または23:59を過ぎる。今日はもう聞かない（ホームのカードからは押せる）
+    td["reask_at"] = reask.isoformat()
+    td["reask_count"] += 1
+    return {"reask_at": td["reask_at"]}
 
 
 def api_cook_items(ctx, body):
-    return {"items": logic.cook_items(ctx["dev"]["inventory"], INGREDIENTS, now(ctx["st"]).date())}
+    return {"items": logic.cook_items(ctx["dev"]["inventory"], FOODS, now(ctx["st"]).date())}
+
+
+def api_cook_record(ctx, body):
+    """使った食材を記録（used にする）。翌日の「昨日、使った食材は？」から来たときも同じ。"""
+    st, dev = ctx["st"], ctx["dev"]
+    for inv_id in body.get("inventory_ids", []):
+        set_status(st, find_inv(dev, inv_id), "used")
+    if body.get("yesterday"):
+        dev["pending_cook_record"] = None
+    else:
+        dev["today"]["cook_recorded"] = True
+    return {"weekly": weekly(st, dev)}
+
+
+def api_cook_record_later(ctx, body):
+    dev = ctx["dev"]
+    dev["pending_cook_record"] = dev["today"]["date"]  # 翌日のホームで1回だけ聞く
+    return {"ok": True}
+
+
+def api_cook_record_skip(ctx, body):
+    ctx["dev"]["pending_cook_record"] = None
+    return {"ok": True}
 
 
 def api_settings_get(ctx, body):
@@ -437,36 +498,33 @@ def api_settings_get(ctx, body):
 
 
 def api_settings_put(ctx, body):
-    ask_time, remind_time = body.get("ask_time"), body.get("remind_time")
-    if not (TIME_RE.match(ask_time or "") and TIME_RE.match(remind_time or "")):
+    s = {k: body.get(k) for k in ("ask_time", "deadline_time", "remind_time")}
+    if not all(TIME_RE.match(v or "") for v in s.values()):
         raise ApiError(400, "時刻は HH:MM の形で指定してください")
-    if remind_time <= ask_time:
-        raise ApiError(400, "リマインドの時刻は、問いかけの時刻より後にしてください")
-    ctx["dev"]["settings"] = {"ask_time": ask_time, "remind_time": remind_time}
-    # 今日の問いかけがまだ答えられていなければ、締め切り（リマインドの時刻）も合わせる
-    ask = ctx["dev"]["asks"].get(now(ctx["st"]).date().isoformat())
-    if ask and ask["answer"] is None:
-        ask["deadline"] = at_time(logic.parse_date(ask["date"]), remind_time).isoformat()
-    return ctx["dev"]["settings"]
+    if not (s["ask_time"] < s["deadline_time"] < s["remind_time"]):
+        raise ApiError(400, "問いかけ → 返事の締め切り → できたかの確認 の順になるようにしてください")
+    s["notify"] = bool(body.get("notify", True))
+    dev = ctx["dev"]
+    dev["settings"] = s
+    td = dev["today"]
+    if td["state"] == "skip_pending" and not td["remind_sent"]:  # 今日の確認の時刻も合わせる
+        remind = at_time(logic.parse_date(td["date"]), s["remind_time"])
+        td["remind_at"] = remind.isoformat() if now(ctx["st"]) < remind else None
+    return s
 
 
 def api_ingredients(ctx, body):
-    return {"items": [{"id": i["id"], "name": i["name"]} for i in INGREDIENTS.values()]}
+    """料理表の食材など、よく使う品目（core）。手入力は /api/foods/search を使う。"""
+    return {"items": [{"id": f["id"], "name": f["name"]} for f in FOODS.values() if f.get("core")]}
 
 
 def api_sources(ctx, body):
-    """食材表の「目安と出典」。発表や画面での説明に使う。"""
-    sources = load_json("data/sources.json")
-    items = []
-    for ing in INGREDIENTS.values():
-        if ing["freezable"]:
-            rescue = f"{ing['freeze_action']}（冷凍したら{ing['freezer_period']}以内）"
-        else:
-            rescue = ing.get("quick_use") or "—"
-        items.append({"name": ing["name"], "fridge_days": ing["fridge_days"], "freezer_days": ing.get("freezer_days"),
-                      "track_expiry": ing.get("track_expiry", True), "rescue": rescue,
-                      "fridge_basis": ing["fridge_basis"], "action_basis": ing.get("action_basis"), "refs": ing["refs"]})
-    return {"items": items, "sources": sources}
+    """目安と出典：分類ごとの冷蔵の目安と、出典の一覧。"""
+    cats = [{"id": c["id"], "label": c["label"], "fridge_days": c["fridge_days"], "freezable": c["freezable"],
+             "track_expiry": c["track_expiry"], "source": c.get("source", ""),
+             "examples": [f["name"] for f in FOODS.values() if f["category"] == c["id"]][:4]}
+            for c in CATEGORIES.values()]
+    return {"categories": cats, "freezer_days": logic.FREEZER_DAYS, "sources": load_json("data/sources.json")}
 
 
 def api_config(ctx, body):
@@ -509,30 +567,33 @@ def api_debug_ping(ctx, body):
 
 
 def api_debug_trigger_ask(ctx, body):
+    """この端末に問いかけを今すぐ出す（今日の返事を消して、通知を送る）。"""
     st, dev, dev_id = ctx["st"], ctx["dev"], ctx["dev_id"]
-    t = now(st)
-    key = t.date().isoformat()
-    dev["asks"].pop(key, None)
-    dev["freeze_checks"].pop(key, None)
-    if not logic.should_ask(dev["inventory"], INGREDIENTS, t.date())["should_ask"]:
+    today = now(st).date()
+    dev["today"] = new_today(today)
+    if not logic.should_ask(dev["inventory"], FOODS, today):
         raise ApiError(409, "今日は早めの食材がないので、問いかけは出ません")
-    make_ask(st, dev_id, dev, t.date(), t)
-    return {"ask": dev["asks"][key]}
+    dev["today"]["ask_sent"] = True
+    dev["today"]["no_deadline"] = at_time(today, dev["settings"]["deadline_time"]) <= now(st)
+    names = "・".join(logic.soon_names(dev["inventory"], FOODS, today))
+    emit(st, dev_id, {"kind": "ask", "date": today.isoformat(), "title": "今日、作れそう？",
+                      "body": f"{names}を、そろそろ使いたい日です。返事しなくても大丈夫。", "url": "/?open=ask"})
+    record(st, dev_id, "ask_sent", date=today.isoformat())
+    return {"today_state": today_state(dev, today)}
 
 
 def api_debug_trigger_remind(ctx, body):
-    """冷凍のリマインドを今すぐ出す（予約中・「あとで」のものを前倒し）。"""
+    """この端末に確認を今すぐ出す（skip_pending の日だけ）。"""
     st, dev = ctx["st"], ctx["dev"]
-    for key in sorted(dev["freeze_checks"], reverse=True):
-        fc = dev["freeze_checks"][key]
-        if fc["status"] in ("scheduled", "later"):
-            if fc["status"] == "later":
-                fc["reask_at"] = now(st).isoformat()
-            else:
-                fc["remind_at"] = now(st).isoformat()
-            tick(st)
-            return {"freeze_check": freeze_check_view(dev, fc)}
-    raise ApiError(404, "予約中のリマインドはありません（先に「無理」と答えてください）")
+    td = dev["today"]
+    if td["state"] != "skip_pending":
+        raise ApiError(409, "確認を送れるのは「あとでやる」の日だけです（先に「今日は無理」→「あとでやる」）")
+    if td["reask_at"]:
+        td["reask_at"] = now(st).isoformat()
+    else:
+        td["remind_at"], td["remind_sent"] = now(st).isoformat(), False
+    tick(st)
+    return {"freeze_pending": td["freeze_pending"]}
 
 
 def api_debug_advance(ctx, body):
@@ -547,24 +608,25 @@ def api_debug_advance(ctx, body):
     return {"now": now(st).isoformat()}
 
 
-def api_debug_use(ctx, body):
-    """デモ用：指定した食材の在庫を「使った」にする（木・金に作った体で）。"""
-    ids = set(body.get("ingredient_ids", []))
-    for inv in ctx["dev"]["inventory"]:
-        if inv["status"] == "stocked" and inv["ingredient_id"] in ids:
-            set_status(ctx["st"], inv, "used")
-    return {"ok": True}
+def api_debug_reset_today(ctx, body):
+    """この端末の今日の返事・確認の予定・再通知を消す（記録は残す）。"""
+    st, dev = ctx["st"], ctx["dev"]
+    today = now(st).date()
+    dev["today"] = new_today(today)
+    dev["today"]["ask_sent"] = True  # リセットしただけで問いかけの通知が飛ばないように
+    dev["today"]["no_deadline"] = True  # 締め切りのあとでリセットしても「今日、作れそう？」に戻す
+    return {"today_state": today_state(dev, today), "message": "リセットしました（『今日、作れそう？』が戻ります）"}
 
 
 def api_debug_reset(ctx, body):
-    """scope：demo（時計とこの端末の在庫・問いかけ）／records（全端末の試用の記録）／all（両方。初期値）。
+    """scope：all（初期値。時計・この端末の在庫と今日の状態・全端末の試用の記録）／demo／records。
     設定・通知の購読・学習した対応は消さない。"""
     st, dev = ctx["st"], ctx["dev"]
     scope = body.get("scope", "all")
     if scope in ("demo", "all"):
         st["clock_offset"] = initial_state()["clock_offset"]
-        fresh = new_device()
-        for k in ("inventory", "next_inv", "asks", "freeze_checks"):
+        fresh = new_device(now(st).date())
+        for k in ("inventory", "next_inv", "today", "pending_cook_record"):
             dev[k] = fresh[k]
     if scope in ("records", "all"):
         st["records"] = []
@@ -572,28 +634,26 @@ def api_debug_reset(ctx, body):
 
 
 def _stats(st):
-    """全端末の記録を、問いかけ（またはリマインド）とその返事の組にして平均を出す。"""
-    rows = []
-    sent = {}
+    """全端末の記録を、通知（問いかけ・確認）とその返事の組にして平均を出す。"""
+    rows, sent = [], {}
     for r in st["records"]:
-        k = (r["device_id"], r.get("date"), "ask" if r["type"] in ("ask_sent", "answered") else "remind")
+        kind = "ask" if r["type"] in ("ask_sent", "answered") else "remind" if r["type"] in ("remind_sent", "remind_answered") else "rescue"
+        k = (r["device_id"], r.get("date"), kind)
         if r["type"] in ("ask_sent", "remind_sent"):
             sent[k] = r
-        elif r["type"] in ("answered", "remind_answered"):
-            s = sent.pop(k, None)
-            secs = (datetime.fromisoformat(r["at"]) - datetime.fromisoformat(s["at"])).total_seconds() if s else None
-            rows.append({"device": r["device_id"][:8], "date": r.get("date"), "kind": k[2],
-                         "sent_at": s["at"] if s else None, "answered_at": r["at"], "seconds": secs,
-                         "taps": r.get("taps"), "via": r.get("via"), "value": r.get("value")})
+            continue
+        s = sent.pop(k, None)
+        secs = (datetime.fromisoformat(r["at"]) - datetime.fromisoformat(s["at"])).total_seconds() if s else None
+        rows.append({"device": r["device_id"][:8], "date": r.get("date"), "kind": kind,
+                     "sent_at": s["at"] if s else None, "answered_at": r["at"], "seconds": secs,
+                     "taps": r.get("taps"), "via": r.get("via"), "value": r.get("value")})
     timed = [x["seconds"] for x in rows if x["seconds"] is not None]
     taps = [x["taps"] for x in rows if x["taps"] is not None]
-    return {
-        "devices": len({r["device_id"] for r in st["records"]}),
-        "avg_seconds": round(sum(timed) / len(timed), 1) if timed else None,
-        "avg_taps": round(sum(taps) / len(taps), 2) if taps else None,
-        "frozen_count": sum(1 for x in rows if x["kind"] == "remind" and x["value"] == "done"),
-        "rows": rows,
-    }
+    frozen = sum(1 for x in rows if (x["kind"] == "remind" and x["value"] == "done") or (x["kind"] == "rescue" and x["value"] == "done_now"))
+    return {"devices": len({r["device_id"] for r in st["records"]}),
+            "avg_seconds": round(sum(timed) / len(timed), 1) if timed else None,
+            "avg_taps": round(sum(taps) / len(taps), 2) if taps else None,
+            "frozen_count": frozen, "rows": rows}
 
 
 def api_debug_stats(ctx, body):
@@ -614,15 +674,18 @@ ROUTES = {
     ("POST", "/api/receipts"): api_receipts,
     ("POST", "/api/inventory/preview"): api_preview,
     ("POST", "/api/inventory/confirm"): api_confirm,
+    ("GET", "/api/foods/search"): api_foods_search,
     ("GET", "/api/home"): api_home,
     ("GET", "/api/inventory"): api_inventory,
+    ("POST", "/api/inventory/remove"): api_inventory_remove,
     ("GET", "/api/suggestions"): api_suggestions,
-    ("POST", "/api/inventory/use"): api_use,
-    ("GET", "/api/cook-items"): api_cook_items,
     ("POST", "/api/answer"): api_answer,
-    ("POST", "/api/action/ack"): api_action_ack,
-    ("POST", "/api/action/already-used"): api_action_already_used,
+    ("POST", "/api/rescue"): api_rescue,
     ("POST", "/api/freeze-check"): api_freeze_check,
+    ("GET", "/api/cook-items"): api_cook_items,
+    ("POST", "/api/cook-record"): api_cook_record,
+    ("POST", "/api/cook-record/later"): api_cook_record_later,
+    ("POST", "/api/cook-record/skip"): api_cook_record_skip,
     ("GET", "/api/settings"): api_settings_get,
     ("PUT", "/api/settings"): api_settings_put,
     ("GET", "/api/ingredients"): api_ingredients,
@@ -639,7 +702,7 @@ DEBUG_ROUTES = {
     ("POST", "/api/debug/trigger-ask"): api_debug_trigger_ask,
     ("POST", "/api/debug/trigger-remind"): api_debug_trigger_remind,
     ("POST", "/api/debug/advance"): api_debug_advance,
-    ("POST", "/api/debug/use"): api_debug_use,
+    ("POST", "/api/debug/reset-today"): api_debug_reset_today,
     ("POST", "/api/debug/reset"): api_debug_reset,
 }
 
@@ -670,11 +733,12 @@ def dispatch(events, subs_by_device):
 def run_locked(fn=None, body=None, dev_id=None):
     with LOCK:
         st = read_state()
+        if fn:
+            st["devices"].setdefault(dev_id, new_device(now(st).date()))
         tick(st)
         result = None
         if fn:
-            dev = st["devices"].setdefault(dev_id, new_device())
-            result = fn({"st": st, "dev": dev, "dev_id": dev_id}, body or {})
+            result = fn({"st": st, "dev": st["devices"][dev_id], "dev_id": dev_id}, body or {})
             tick(st)
         events = st.pop("_events", [])
         subs = {e["device_id"]: list(st["devices"].get(e["device_id"], {}).get("push_subscriptions", [])) for e in events}
@@ -684,7 +748,7 @@ def run_locked(fn=None, body=None, dev_id=None):
 
 
 def scheduler():
-    """問いかけ・締め切り・リマインドを、画面が開いていなくても進めて通知する。"""
+    """問いかけ・締め切り・確認・再通知を、画面が開いていなくても進めて通知する。"""
     while True:
         time.sleep(SCHEDULER_SECONDS)
         try:
@@ -704,7 +768,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _handle(self, method):
-        path = urlparse(self.path).path
+        url = urlparse(self.path)
+        path = url.path
         if path.startswith("/api/"):
             fn = ROUTES.get((method, path))
             if fn is None and (method, path) in DEBUG_ROUTES:
@@ -720,8 +785,11 @@ class Handler(BaseHTTPRequestHandler):
             if not DEVICE_ID_RE.match(dev_id):
                 return self._send(400, {"error": "ヘッダー X-Device-Id（端末ごとのID）がありません"})
             try:
-                length = int(self.headers.get("Content-Length") or 0)
-                body = json.loads(self.rfile.read(length) or b"{}") if length else {}
+                if method == "GET":
+                    body = {k: v[0] for k, v in parse_qs(url.query).items()}
+                else:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    body = json.loads(self.rfile.read(length) or b"{}") if length else {}
                 result = run_locked(fn, body, dev_id)
                 if isinstance(result, tuple):  # (content-type, bytes)
                     return self._send(200, result[1], result[0])

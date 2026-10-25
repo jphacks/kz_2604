@@ -3,16 +3,19 @@
 順番（CLAUDE.md 第10節）：
 1. 学習した対応（JANコード → 表記）に当たれば、それを使う
 2. 正規化：NFKC → カタカナをひらがなに → 空白・記号を除く（keywords にも同じ処理）
-3. キーワード照合：品名に keywords が含まれていれば当てる。長いキーワードから先に
+3. キーワード照合：品名に keywords が含まれていれば当てる。長いキーワードから先に。
+   1文字のキーワード（卵、酢、塩、米など）は、品名全体がその1文字のときだけ当てる（「酢豚」を酢にしない）
 4. 共通の除外語（の素・たれ・ソース・ドレッシング）を含む行は、track_expiry: true の生鮮食材には当てない
 5. 当たらない行は unmatched に入れ、候補（candidates）を付ける
+学習した対応には「食材ではない」（NOT_FOOD）も入る。その行は not_food に入れる。
 """
 import re
 import unicodedata
 from datetime import date
 
 EXCLUDE_WORDS = ["の素", "たれ", "ソース", "ドレッシング"]
-MAX_CANDIDATES = 3
+MAX_CANDIDATES = 2   # 画面では候補のチップのあとに［食材ではない］を付ける
+NOT_FOOD = "__not_food__"
 
 # 予備の経路（端末のOCR）で、品名ではない行を落とすための語
 NON_ITEM_WORDS = [
@@ -54,21 +57,26 @@ def _keywords(ingredients):
 def _keyword_match(norm, ingredients, keywords):
     excluded = any(normalize(w) in norm for w in EXCLUDE_WORDS)
     for kw, ing_id in keywords:
-        if kw in norm and not (excluded and ingredients[ing_id]["track_expiry"]):
+        hit = (kw == norm) if len(kw) == 1 else (kw in norm)
+        if hit and not (excluded and ingredients[ing_id]["track_expiry"]):
             return ing_id
     return None
 
 
-def _common_len(a, b):
-    """いちばん長い共通の部分文字列の長さ"""
-    best = 0
+def _common(a, b):
+    """いちばん長い共通の部分文字列"""
+    best = ""
     for i in range(len(a)):
-        for j in range(i + best + 1, len(a) + 1):
+        for j in range(i + len(best) + 1, len(a) + 1):
             if a[i:j] in b:
-                best = j - i
+                best = a[i:j]
             else:
                 break
     return best
+
+
+KANJI_RE = re.compile(r"[一-鿿]")
+KANA_ONLY_MIN = 5  # かなだけの重なりはこれ以上（「ティッシュ」と「ラディッシュ」の「ぃっしゅ」で候補にしない）
 
 
 def candidates(norm, ingredients):
@@ -78,9 +86,9 @@ def candidates(norm, ingredients):
         best = 0.0
         for kw in [ing["name"], *ing["keywords"]]:
             k = normalize(kw)
-            n = _common_len(k, norm)
-            if n >= 2:
-                best = max(best, n / len(k))
+            c = _common(k, norm)
+            if len(c) >= 2 and (KANJI_RE.search(c) or len(c) >= KANA_ONLY_MIN):
+                best = max(best, len(c) / len(k))
         if best >= 0.5:
             scored.append((-best, ing["id"]))
     scored.sort()
@@ -89,11 +97,11 @@ def candidates(norm, ingredients):
 
 def match_lines(lines, ingredients, learned=None):
     """lines: [{"name": 品名, "jan": JANコード or None}]（LLMの文字起こし）
-    learned: {"names": {正規化した品名: id}, "jans": {JAN: id}}（端末ごとに学習した対応）"""
+    learned: {"names": {正規化した品名: id or NOT_FOOD}, "jans": {JAN: id or NOT_FOOD}}（端末ごとに学習した対応）"""
     learned = learned or {}
     names, jans = learned.get("names", {}), learned.get("jans", {})
     keywords = _keywords(ingredients)
-    matched, unmatched = [], []
+    matched, unmatched, not_food = [], [], []
     for i, line in enumerate(lines, 1):
         raw = clean_raw(line.get("name"))
         norm = normalize(raw)
@@ -102,6 +110,9 @@ def match_lines(lines, ingredients, learned=None):
         jan = line.get("jan") or None
         line_id = f"l{i}"
         ing_id, by = None, None
+        if (jan and jans.get(jan) == NOT_FOOD) or names.get(norm) == NOT_FOOD:
+            not_food.append({"line_id": line_id, "raw": raw, "jan": jan})
+            continue
         if jan and jans.get(jan) in ingredients:
             ing_id, by = jans[jan], "jan"
         elif names.get(norm) in ingredients:
@@ -110,10 +121,27 @@ def match_lines(lines, ingredients, learned=None):
             ing_id = _keyword_match(norm, ingredients, keywords)
             by = "keyword" if ing_id else None
         if ing_id:
-            matched.append({"line_id": line_id, "ingredient_id": ing_id, "raw": raw, "jan": jan, "by": by})
+            matched.append({"line_id": line_id, "food_id": ing_id, "raw": raw, "jan": jan, "by": by})
         else:
             unmatched.append({"line_id": line_id, "raw": raw, "jan": jan, "candidates": candidates(norm, ingredients)})
-    return {"matched": matched, "unmatched": unmatched}
+    return {"matched": matched, "unmatched": unmatched, "not_food": not_food}
+
+
+def search(q, ingredients, limit=10):
+    """手入力の候補。よみ・名前・キーワードに対して、前方一致を先に、次に部分一致で。
+    入力も同じ正規化をするので、ひらがな・カタカナ・漢字のどれで打っても当たる。"""
+    nq = normalize(q)
+    if not nq:
+        return []
+    prefix, partial = [], []
+    for ing in ingredients.values():
+        terms = [normalize(t) for t in [ing.get("reading") or "", ing["name"], *ing["keywords"]] if t]
+        if any(t.startswith(nq) for t in terms):
+            prefix.append(ing)
+        elif any(nq in t for t in terms):
+            partial.append(ing)
+    by_len = lambda i: (not i.get("core"), len(i["name"]), i["name"])  # 手で値を決めた品目を先に、次に短い名前
+    return [{"id": i["id"], "name": i["name"]} for i in sorted(prefix, key=by_len) + sorted(partial, key=by_len)][:limit]
 
 
 def extract_date(text):
