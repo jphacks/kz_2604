@@ -206,7 +206,7 @@ async function renderHome(seq) {
   bind("see-all", () => show("fridge"));
   bind("go-settings", () => show("settings"));
   bind("go-fridge", () => show("fridge"));
-  bind("go-receipt", () => show("receipt"));
+  bind("go-receipt", openCamera);
   setupLongPress(document.getElementById("appname"));
   if (devOpen) renderDevMenu(seq);
 }
@@ -270,6 +270,7 @@ async function renderDevMenu(seq) {
           <button id="d-hour">1時間進める</button>
           <button id="d-morning">次の日の朝へ</button>
           <button id="d-demo-receipt">デモ用レシートを登録</button>
+          <button id="d-real-time">実際の時刻に戻す</button>
           <button id="d-reset">デモを初期化（10/26 19:00）</button>
         </div>
         <p class="sub">デモ用の時計：${esc(fmtDay(home.now))} ${esc(fmtTime(home.now))}</p>
@@ -302,6 +303,7 @@ async function renderDevMenu(seq) {
   bind("d-hour", run(() => api("POST", "/api/debug/advance", { minutes: 60 })));
   bind("d-morning", run(() => api("POST", "/api/debug/advance", { to: `${next}T09:00:00+09:00` })));
   bind("d-demo-receipt", async () => { devOpen = false; sentImages = []; startConfirm(await api("POST", "/api/receipts", { use_fixture: true })); });
+  bind("d-real-time", run(() => api("POST", "/api/debug/real-time"), "実際の時刻に戻しました"));
   bind("d-reset", run(() => api("POST", "/api/debug/reset", { scope: "demo" }), "初期化しました（10/26 19:00）"));
 }
 
@@ -554,6 +556,27 @@ function renderReceipt(error) {
   pick.onchange = () => onFile(pick);
 }
 
+// ホームの「レシートを撮る」：押したらすぐカメラを開く（click は押した処理の中で同期して呼ぶ。でないとブラウザが開かせない）。
+// 入力欄は画面の外に1つだけ置く（カメラを開いている間にホームが描き直されても、撮った画像を受け取れるように）。
+// 撮らずに閉じたらホームのまま。画像を開けなかったときだけ撮影画面（「写真から選ぶ」もある）に移る
+let cameraInput = null;
+function openCamera() {
+  if (!cameraInput) {
+    cameraInput = Object.assign(document.createElement("input"), { type: "file", accept: "image/*", hidden: true });
+    cameraInput.setAttribute("capture", "environment");
+    document.body.appendChild(cameraInput);
+    cameraInput.onchange = async () => {
+      const f = cameraInput.files[0];
+      cameraInput.value = "";  // 同じ写真をもう一度選んでも change が出るように
+      if (!f) return;
+      view = "receipt";
+      try { readReceipt(await imageFileToCanvas(f)); }
+      catch (e) { renderReceipt("画像を開けませんでした"); }
+    };
+  }
+  cameraInput.click();
+}
+
 function imageFileToCanvas(f) {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -719,7 +742,7 @@ const ENGINE_LABEL = { llm: "AIで読み取りました", tesseract: "予備の�
 
 function startConfirm(result, reasons = []) {
   draft = {
-    purchased_at: result.purchased_at,
+    purchased_at: result.purchased_at, date_note: result.date_note || null,
     engine: result.engine, model: result.model, transcript: result.transcript, reasons,
     matched: result.matched.map(m => ({ ...m, checked: true })),
     unmatched: result.unmatched.map(u => ({ ...u, choice: null })),  // choice：food_id か "not_food"
@@ -750,6 +773,7 @@ function renderConfirm() {
     <div class="screen">
       <label class="label date-pick">${esc(fmtDay(draft.purchased_at))}のレシート（購入日を変える）
         <input type="date" id="pdate" value="${esc(draft.purchased_at)}"></label>
+      ${draft.date_note ? `<p class="note">${esc(draft.date_note)}</p>` : ""}
       ${title("登録する食材にチェック")}
       <div class="list checks">${draft.matched.length ? draft.matched.map((m, i) => `
           <div class="check-row ${m.checked ? "on" : ""}" data-i="${i}" role="checkbox" aria-checked="${m.checked}" tabindex="0">
@@ -826,7 +850,7 @@ function renderConfirm() {
     draft.query = ""; draft.results = [];
     refreshSoon();
   });
-  document.getElementById("pdate").onchange = e => { if (e.target.value) { draft.purchased_at = e.target.value; refreshSoon(); } };
+  document.getElementById("pdate").onchange = e => { if (e.target.value) { draft.purchased_at = e.target.value; draft.date_note = null; refreshSoon(); } };
   document.getElementById("src").onclick = e => { e.preventDefault(); show("sources"); };
   document.getElementById("cancel").onclick = () => { draft = null; show("home"); };
   document.getElementById("ok").onclick = async () => {

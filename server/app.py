@@ -3,7 +3,7 @@
     python -m server.app            # http://localhost:8000 （同じWi-Fiの端末からは http://<PCのIP>:8000）
 
 - データはすべて端末ごとのID（ヘッダー X-Device-Id）で分ける。IDがないリクエストは 400
-- 時刻はサーバーが持つ「デモ用の時計」で進む（実時間と同じ速さで進み、/api/debug/advance で先に進められる）
+- 時刻は端末ごとの時計で進む。ふだんは実際の時刻。開発者メニュー（/api/debug/advance・reset）で、その端末だけ進められる
 - 問いかけ・締め切り・確認・再通知はすべてサーバーが処理する（15秒ごとに確認）
 - 端末ごとに「今日の状態」（today_state）を持つ：unanswered / skip_pending / done / cook / none
 """
@@ -31,9 +31,10 @@ from .receipt import engine as receipt_engine
 ROOT = Path(__file__).resolve().parent.parent
 WEB = ROOT / "web"
 STATE_FILE = ROOT / "var" / "state.json"
-STATE_VERSION = 3
+STATE_VERSION = 4
 JST = timezone(timedelta(hours=9))
-DEMO_START = datetime(2026, 10, 26, 19, 0, tzinfo=JST)  # 月曜、買い物から帰ったところ
+DEMO_START = datetime(2026, 10, 26, 19, 0, tzinfo=JST)  # 「デモを初期化」で合わせる時刻（月曜、買い物から帰ったところ）
+RECEIPT_DATE_MAX_AGE_DAYS = 14  # レシートの日付がこれより古い・未来なら、読み違いとみなして今日にする
 DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")
 TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
@@ -103,12 +104,12 @@ def new_device(today):
         "pending_cook_record": None,  # 「あとで記録する」を選んだ日。翌日のホームで1回だけ聞く
         "push_subscriptions": [],
         "learned": {"names": {}, "jans": {}},
+        "clock_offset": 0,  # 秒。0 なら実際の時刻。開発者メニューのデモ操作で、この端末だけずらす
     }
 
 
 def initial_state():
-    return {"version": STATE_VERSION, "clock_offset": (DEMO_START - datetime.now(JST)).total_seconds(),
-            "devices": {}, "records": []}
+    return {"version": STATE_VERSION, "devices": {}, "records": []}
 
 
 def drop_unknown_foods(st):
@@ -120,9 +121,25 @@ def drop_unknown_foods(st):
     return st
 
 
+def migrate_v3(st):
+    """v3（全端末で1つの時計）→ v4（端末ごとの時計）。在庫などはそのまま残し、時計は実際の時刻に戻す。
+    v3 では読み違えたレシートの日付（2020年など）がそのまま入っていたので、明らかに古いものは今日にする。"""
+    today = datetime.now(JST).date()
+    for dev in st["devices"].values():
+        dev["clock_offset"] = 0
+        for inv in dev["inventory"]:
+            if (today - logic.parse_date(inv["purchased_at"])).days > 365:
+                inv["purchased_at"] = today.isoformat()
+    st.pop("clock_offset", None)
+    st["version"] = STATE_VERSION
+    return st
+
+
 def read_state():
     if STATE_FILE.exists():
         st = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if st.get("version") == 3:
+            st = migrate_v3(st)
         if st.get("version") == STATE_VERSION:
             return drop_unknown_foods(st)
         # 前の形式（食材表が変わる前）のファイルは使わない（新しく始める）
@@ -136,8 +153,9 @@ def write_state(st):
     STATE_FILE.write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def now(st):
-    return datetime.now(JST) + timedelta(seconds=st["clock_offset"])
+def now(dev):
+    """その端末の時刻。ふだんは実際の時刻（clock_offset が 0）。"""
+    return datetime.now(JST) + timedelta(seconds=dev.get("clock_offset", 0))
 
 
 def at_time(d, hhmm):
@@ -152,7 +170,7 @@ def emit(st, dev_id, message):
 
 def record(st, dev_id, type_, **fields):
     """試用の記録（実証用）。type：ask_sent / answered / remind_sent / remind_answered / rescue"""
-    st["records"].append({"device_id": dev_id, "type": type_, "at": now(st).isoformat(), **fields})
+    st["records"].append({"device_id": dev_id, "type": type_, "at": now(st["devices"].get(dev_id, {})).isoformat(), **fields})
 
 
 def notify_enabled(dev):
@@ -182,7 +200,7 @@ def apply_skip(st, dev, d, by):
     if action:
         t["state"] = "skip_pending"
         remind = at_time(d, dev["settings"]["remind_time"])
-        t["remind_at"] = remind.isoformat() if now(st) < remind else None
+        t["remind_at"] = remind.isoformat() if now(dev) < remind else None
     else:
         t["state"] = "done"
         t["remind_at"] = None
@@ -199,7 +217,7 @@ def finish_rescue(st, dev, status):
     """救済行動の対象の在庫を frozen / used / gone にして、今日はおしまいにする。"""
     t = dev["today"]
     inv = find_inv(dev, t["rescue"]["inventory_id"])
-    set_status(st, inv, status)
+    set_status(dev, inv, status)
     t.update({"state": "done", "result": status, "remind_at": None, "reask_at": None, "freeze_pending": False})
     return inv
 
@@ -239,9 +257,8 @@ def tick_device(st, dev_id, dev, t):
 
 
 def tick(st):
-    t = now(st)
     for dev_id, dev in st["devices"].items():
-        tick_device(st, dev_id, dev, t)
+        tick_device(st, dev_id, dev, now(dev))
 
 
 def find_inv(dev, inv_id):
@@ -251,27 +268,42 @@ def find_inv(dev, inv_id):
     raise ApiError(404, f"在庫 {inv_id} がありません")
 
 
-def set_status(st, inv, status):
+def set_status(dev, inv, status):
     inv["status"] = status
-    inv["updated_at"] = now(st).isoformat()
+    inv["updated_at"] = now(dev).isoformat()
     if status == "frozen":
-        inv["frozen_at"] = now(st).date().isoformat()
+        inv["frozen_at"] = now(dev).date().isoformat()
 
 
 def weekly(st, dev):
-    return logic.weekly_card(dev["inventory"], FOODS, now(st).date())
+    return logic.weekly_card(dev["inventory"], FOODS, now(dev).date())
 
 
-def frozen_until(st, food_id):
+def frozen_until(dev, food_id):
     days = FOODS[food_id].get("freezer_days") or logic.FREEZER_DAYS
-    return (now(st).date() + timedelta(days=days)).isoformat()
+    return (now(dev).date() + timedelta(days=days)).isoformat()
 
 
 # ---------------- API ----------------
 
+def check_purchase_date(read_date, today):
+    """レシートから読んだ購入日を確かめる。読めない・未来・RECEIPT_DATE_MAX_AGE_DAYS より古いときは、
+    読み違いとみなして今日にする（古い日付のままだと、買ったばかりの肉が「状態を確認してください」になる）。"""
+    if not read_date:
+        return today.isoformat(), "レシートの日付が読めなかったので、今日の日付にしました。違っていたら変えてください。"
+    try:
+        d = logic.parse_date(read_date)
+    except ValueError:
+        return today.isoformat(), "レシートの日付が読めなかったので、今日の日付にしました。違っていたら変えてください。"
+    if 0 <= (today - d).days <= RECEIPT_DATE_MAX_AGE_DAYS:
+        return d.isoformat(), None
+    return today.isoformat(), (f"レシートの日付が {d.year}/{d.month}/{d.day} と読めましたが、読み違いかもしれないので"
+                               "今日の日付にしました。違っていたら変えてください。")
+
+
 def api_receipts(ctx, body):
     st, dev = ctx["st"], ctx["dev"]
-    today = now(st).date()
+    today = now(dev).date()
     if body.get("use_fixture"):
         read, engine, extra = load_json("fixtures/receipt_demo.json"), "fixture", {}
     elif body.get("ocr_text") is not None:
@@ -292,7 +324,7 @@ def api_receipts(ctx, body):
         engine = "llm"
         extra = {"provider": read["engine"], "model": read["model"],
                  "transcript": "\n".join(l["name"] + (f"  [{l['jan']}]" if l["jan"] else "") for l in read["lines"])}
-    purchased_at = read.get("purchased_at") or today.isoformat()
+    purchased_at, date_note = check_purchase_date(read.get("purchased_at"), today)
     result = match_lines(read["lines"], FOODS, dev["learned"], PANTRY)
     for m in result["matched"]:
         food = FOODS[m["food_id"]]
@@ -300,12 +332,13 @@ def api_receipts(ctx, body):
         m.update({"name": food["name"], "soon": logic.is_soon(left), **logic.state_fields(left, food)})
     for u in result["unmatched"]:
         u["candidates"] = [{"id": c, "name": FOODS[c]["name"]} for c in u["candidates"]]
-    return {"purchased_at": purchased_at, **result, "engine": engine, **extra}
+    return {"purchased_at": purchased_at, "date_note": date_note, "read_date": read.get("purchased_at"),
+            **result, "engine": engine, **extra}
 
 
 def api_preview(ctx, body):
     """画面2で選んだ食材・購入日について「早めに」かどうかを返す。"""
-    today = now(ctx["st"]).date()
+    today = now(ctx["dev"]).date()
     out = []
     for fid in body.get("food_ids", []):
         food = FOODS.get(fid)
@@ -335,11 +368,11 @@ def api_confirm(ctx, body):
         inv = {"id": f"inv_{dev['next_inv']:03d}", "food_id": fid, "raw": it.get("raw", ""),
                "purchased_at": body["purchased_at"], "frozen_at": None,
                "expiry_override": it.get("expiry_override") or None,
-               "status": "stocked", "was_soon": False, "updated_at": now(st).isoformat()}
+               "status": "stocked", "was_soon": False, "updated_at": now(dev).isoformat()}
         dev["next_inv"] += 1
         dev["inventory"].append(inv)
         added.append(inv["id"])
-    logic.mark_was_soon(dev["inventory"], FOODS, now(st).date())
+    logic.mark_was_soon(dev["inventory"], FOODS, now(dev).date())
     return {"added": added}
 
 
@@ -370,14 +403,14 @@ def bell(dev, state):
 
 def api_home(ctx, body):
     st, dev = ctx["st"], ctx["dev"]
-    t = now(st)
+    t = now(dev)
     today = t.date()
     td = dev["today"]
     state = today_state(dev, today)
     card = {"items": logic.soon_names(dev["inventory"], FOODS, today)}
     if td["rescue"]:
         card["action"] = td["rescue"]
-        card["until"] = frozen_until(st, td["rescue"]["food_id"])
+        card["until"] = frozen_until(dev, td["rescue"]["food_id"])
     card.update({"note": td["note"], "result": td.get("result"), "cook_recorded": td["cook_recorded"],
                  "deadline": dev["settings"]["deadline_time"], "remind_time": dev["settings"]["remind_time"]})
     pending = dev["pending_cook_record"]
@@ -396,7 +429,7 @@ def api_home(ctx, body):
 
 
 def api_inventory(ctx, body):
-    return logic.fridge_view(ctx["dev"]["inventory"], FOODS, now(ctx["st"]).date())
+    return logic.fridge_view(ctx["dev"]["inventory"], FOODS, now(ctx["dev"]).date())
 
 
 def api_inventory_remove(ctx, body):
@@ -410,12 +443,12 @@ def api_inventory_remove(ctx, body):
 
 def api_suggestions(ctx, body):
     limit = int(body.get("limit") or logic.LIST_DISHES)
-    return {"dishes": logic.suggestions(ctx["dev"]["inventory"], FOODS, DISHES, now(ctx["st"]).date(), limit)}
+    return {"dishes": logic.suggestions(ctx["dev"]["inventory"], FOODS, DISHES, now(ctx["dev"]).date(), limit)}
 
 
 def api_answer(ctx, body):
     st, dev, dev_id = ctx["st"], ctx["dev"], ctx["dev_id"]
-    today = now(st).date()
+    today = now(dev).date()
     answer = body.get("answer")
     if answer not in ("skip", "cook"):
         raise ApiError(400, "answer は skip か cook")
@@ -443,7 +476,7 @@ def api_rescue(ctx, body):
     record(st, dev_id, "rescue", date=td["date"], value=result, taps=1, via=body.get("via") or "screen")
     if result == "done_now":
         inv = finish_rescue(st, dev, "frozen")
-        return {"until": frozen_until(st, inv["food_id"]), "weekly": weekly(st, dev), "name": FOODS[inv["food_id"]]["name"]}
+        return {"until": frozen_until(dev, inv["food_id"]), "weekly": weekly(st, dev), "name": FOODS[inv["food_id"]]["name"]}
     if result == "already_used":
         finish_rescue(st, dev, "used")
         return {"weekly": weekly(st, dev)}
@@ -462,13 +495,13 @@ def api_freeze_check(ctx, body):
            taps=int(body.get("taps") or 1), via=body.get("via") or "screen")
     if answer == "done":
         inv = finish_rescue(st, dev, "frozen")
-        return {"until": frozen_until(st, inv["food_id"]), "weekly": weekly(st, dev), "name": FOODS[inv["food_id"]]["name"]}
+        return {"until": frozen_until(dev, inv["food_id"]), "weekly": weekly(st, dev), "name": FOODS[inv["food_id"]]["name"]}
     if answer == "gone":
         finish_rescue(st, dev, "gone")
         return {"weekly": weekly(st, dev)}
     td["freeze_pending"] = False
-    reask = now(st) + timedelta(minutes=logic.REASK_MINUTES)
-    last = at_time(now(st).date(), logic.LAST_REASK)
+    reask = now(dev) + timedelta(minutes=logic.REASK_MINUTES)
+    last = at_time(now(dev).date(), logic.LAST_REASK)
     if td["reask_count"] >= logic.MAX_REASK or reask > last:
         return {"reask_at": None}  # 2回目、または23:59を過ぎる。今日はもう聞かない（ホームのカードからは押せる）
     td["reask_at"] = reask.isoformat()
@@ -477,14 +510,14 @@ def api_freeze_check(ctx, body):
 
 
 def api_cook_items(ctx, body):
-    return {"items": logic.cook_items(ctx["dev"]["inventory"], FOODS, now(ctx["st"]).date())}
+    return {"items": logic.cook_items(ctx["dev"]["inventory"], FOODS, now(ctx["dev"]).date())}
 
 
 def api_cook_record(ctx, body):
     """使った食材を記録（used にする）。翌日の「昨日、使った食材は？」から来たときも同じ。"""
     st, dev = ctx["st"], ctx["dev"]
     for inv_id in body.get("inventory_ids", []):
-        set_status(st, find_inv(dev, inv_id), "used")
+        set_status(dev, find_inv(dev, inv_id), "used")
     if body.get("yesterday"):
         dev["pending_cook_record"] = None
     else:
@@ -519,7 +552,7 @@ def api_settings_put(ctx, body):
     td = dev["today"]
     if td["state"] == "skip_pending" and not td["remind_sent"]:  # 今日の確認の時刻も合わせる
         remind = at_time(logic.parse_date(td["date"]), s["remind_time"])
-        td["remind_at"] = remind.isoformat() if now(ctx["st"]) < remind else None
+        td["remind_at"] = remind.isoformat() if now(ctx["dev"]) < remind else None
     return s
 
 
@@ -579,12 +612,12 @@ def api_debug_ping(ctx, body):
 def api_debug_trigger_ask(ctx, body):
     """この端末に問いかけを今すぐ出す（今日の返事を消して、通知を送る）。"""
     st, dev, dev_id = ctx["st"], ctx["dev"], ctx["dev_id"]
-    today = now(st).date()
+    today = now(dev).date()
     dev["today"] = new_today(today)
     if not logic.should_ask(dev["inventory"], FOODS, today):
         raise ApiError(409, "今日は早めの食材がないので、問いかけは出ません")
     dev["today"]["ask_sent"] = True
-    dev["today"]["no_deadline"] = at_time(today, dev["settings"]["deadline_time"]) <= now(st)
+    dev["today"]["no_deadline"] = at_time(today, dev["settings"]["deadline_time"]) <= now(dev)
     names = "・".join(logic.soon_names(dev["inventory"], FOODS, today))
     emit(st, dev_id, {"kind": "ask", "date": today.isoformat(), "title": "今日、作れそう？",
                       "body": f"{names}を、そろそろ使いたい日です。返事しなくても大丈夫。", "url": "/?open=ask"})
@@ -599,29 +632,38 @@ def api_debug_trigger_remind(ctx, body):
     if td["state"] != "skip_pending":
         raise ApiError(409, "確認を送れるのは「あとでやる」の日だけです（先に「今日は無理」→「あとでやる」）")
     if td["reask_at"]:
-        td["reask_at"] = now(st).isoformat()
+        td["reask_at"] = now(dev).isoformat()
     else:
-        td["remind_at"], td["remind_sent"] = now(st).isoformat(), False
+        td["remind_at"], td["remind_sent"] = now(dev).isoformat(), False
     tick(st)
     return {"freeze_pending": td["freeze_pending"]}
 
 
 def api_debug_advance(ctx, body):
-    st = ctx["st"]
+    """この端末の時計だけを進める（ほかの端末は実際の時刻のまま）。"""
+    dev = ctx["dev"]
     if body.get("to"):
         target = datetime.fromisoformat(body["to"])
         if target.tzinfo is None:
             target = target.replace(tzinfo=JST)
-        st["clock_offset"] += (target - now(st)).total_seconds()
+        dev["clock_offset"] = dev.get("clock_offset", 0) + (target - now(dev)).total_seconds()
     else:
-        st["clock_offset"] += float(body.get("minutes", 60)) * 60
-    return {"now": now(st).isoformat()}
+        dev["clock_offset"] = dev.get("clock_offset", 0) + float(body.get("minutes", 60)) * 60
+    return {"now": now(dev).isoformat()}
+
+
+def api_debug_real_time(ctx, body):
+    """この端末の時計を実際の時刻に戻す（デモのあとに使う）。在庫は残す。"""
+    dev = ctx["dev"]
+    dev["clock_offset"] = 0
+    dev["today"] = new_today(now(dev).date())
+    return {"now": now(dev).isoformat()}
 
 
 def api_debug_reset_today(ctx, body):
     """この端末の今日の返事・確認の予定・再通知を消す（記録は残す）。"""
     st, dev = ctx["st"], ctx["dev"]
-    today = now(st).date()
+    today = now(dev).date()
     dev["today"] = new_today(today)
     dev["today"]["ask_sent"] = True  # リセットしただけで問いかけの通知が飛ばないように
     dev["today"]["no_deadline"] = True  # 締め切りのあとでリセットしても「今日、作れそう？」に戻す
@@ -629,18 +671,18 @@ def api_debug_reset_today(ctx, body):
 
 
 def api_debug_reset(ctx, body):
-    """scope：all（初期値。時計・この端末の在庫と今日の状態・全端末の試用の記録）／demo／records。
+    """scope：all（初期値。この端末の時計・在庫・今日の状態と、全端末の試用の記録）／demo／records。
     設定・通知の購読・学習した対応は消さない。"""
     st, dev = ctx["st"], ctx["dev"]
     scope = body.get("scope", "all")
     if scope in ("demo", "all"):
-        st["clock_offset"] = initial_state()["clock_offset"]
-        fresh = new_device(now(st).date())
+        fresh = new_device(DEMO_START.date())
+        dev["clock_offset"] = (DEMO_START - datetime.now(JST)).total_seconds()  # この端末だけ 10/26 19:00 に
         for k in ("inventory", "next_inv", "today", "pending_cook_record"):
             dev[k] = fresh[k]
     if scope in ("records", "all"):
         st["records"] = []
-    return {"now": now(st).isoformat()}
+    return {"now": now(dev).isoformat()}
 
 
 def _stats(st):
@@ -712,6 +754,7 @@ DEBUG_ROUTES = {
     ("POST", "/api/debug/trigger-ask"): api_debug_trigger_ask,
     ("POST", "/api/debug/trigger-remind"): api_debug_trigger_remind,
     ("POST", "/api/debug/advance"): api_debug_advance,
+    ("POST", "/api/debug/real-time"): api_debug_real_time,
     ("POST", "/api/debug/reset-today"): api_debug_reset_today,
     ("POST", "/api/debug/reset"): api_debug_reset,
 }
@@ -744,7 +787,7 @@ def run_locked(fn=None, body=None, dev_id=None):
     with LOCK:
         st = read_state()
         if fn:
-            st["devices"].setdefault(dev_id, new_device(now(st).date()))
+            st["devices"].setdefault(dev_id, new_device(datetime.now(JST).date()))
         tick(st)
         result = None
         if fn:
